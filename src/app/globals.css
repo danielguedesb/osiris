@@ -2247,3 +2247,6 @@ html, body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* PYTHIA overlay */
+.pythia-display { letter-spacing: 0.25em; }

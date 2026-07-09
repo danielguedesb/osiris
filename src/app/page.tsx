@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair } from 'lucide-react';
+import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair, Eye, MessageSquare } from 'lucide-react';
 import IntelFeed from '@/components/IntelFeed';
 import MarketsPanel from '@/components/MarketsPanel';
 import ScmPanel from '@/components/ScmPanel';
@@ -22,6 +22,11 @@ const CameraViewer = dynamic(() => import('@/components/CameraViewer'));
 const OsintPanel = dynamic(() => import('@/components/OsintPanel'));
 const EntityGraphPanel = dynamic(() => import('@/components/EntityGraphPanel'));
 const TokenPanel = dynamic(() => import('@/components/TokenPanel'));
+// PYTHIA overlay
+const PythiaPanel = dynamic(() => import('@/components/PythiaPanel'));
+const PythiaStatus = dynamic(() => import('@/components/PythiaStatus'));
+const ChatBox = dynamic(() => import('@/components/ChatBox'));
+const HeadlineTicker = dynamic(() => import('@/components/HeadlineTicker'));
 function useIsMobile() {
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
@@ -103,6 +108,8 @@ export default function Dashboard() {
   const [showLayers, setShowLayers] = useState(true);
   const [showMarkets, setShowMarkets] = useState(false);
   const [showAlerts, setShowAlerts] = useState(false);
+  const [showPythia, setShowPythia] = useState(false);
+  const [showChat, setShowChat] = useState(false);
   const [showScmPanel, setShowScmPanel] = useState(true);
   const [showIntel, setShowIntel] = useState(false);
   const [showEntityGraph, setShowEntityGraph] = useState(false);
@@ -159,6 +166,8 @@ export default function Dashboard() {
     sdk_naval: true,
     terrain_3d: false,
     malware: false,
+    predictions: true,
+    predictions_all: false,
   });
   const [liveFeedUrl, setLiveFeedUrl] = useState<string | null>(null);
   const [liveFeedName, setLiveFeedName] = useState('');
@@ -335,6 +344,16 @@ export default function Dashboard() {
       setBackendStatus('error');
     }
   }, []);
+
+  // PYTHIA forecasts → map data (once on load + every 30s; rings render when
+  // the map layer wires them up — harmless until then). Must sit BELOW the
+  // fetchEndpoint definition (const in TDZ at render time).
+  useEffect(() => {
+    const load = () => fetchEndpoint('/api/engine/predictions', d => ({ pythia_predictions: d.predictions || [] }));
+    load();
+    const iv = setInterval(load, 30000);
+    return () => clearInterval(iv);
+  }, [fetchEndpoint]);
 
   // ── PROGRESSIVE DATA LOADING (request-optimized) ──
   useEffect(() => {
@@ -894,6 +913,8 @@ export default function Dashboard() {
 
         <UptimeClock />
         <span className="text-[10px] font-bold tracking-[0.2em] text-[var(--text-muted)] opacity-50 ml-2">V.4.1</span>
+
+        <PythiaStatus compact />
         
         <TokenPanel />
 
@@ -931,8 +952,38 @@ export default function Dashboard() {
 
       {/* ── RIGHT TOOL STRIP (desktop only — mobile uses bottom nav) ── */}
       {!isMobile && <div className="absolute right-2 top-1/2 -translate-y-1/2 flex flex-col gap-2 z-[250] pointer-events-auto bg-black/40 backdrop-blur-sm p-1 rounded-full border border-white/5">
+        {/* PYTHIA */}
         <div className="relative group">
-          <button onClick={() => { setShowIntel(!showIntel); setShowMarkets(false); setShowAlerts(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showIntel ? 'bg-[var(--cyan-primary)]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowPythia(!showPythia); setShowChat(false); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showPythia ? 'bg-[#9a7bff]/25' : 'hover:bg-white/10'}`} title="PYTHIA — forecasts">
+            <Eye className={`w-4 h-4 ${showPythia ? 'text-[#c9b8ff]' : 'text-white/60'}`} />
+          </button>
+          <AnimatePresence>
+            {showPythia && (
+              <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-96">
+                <PythiaPanel onLocate={(lat, lng) => { setFlyToLocation({ lat, lng, zoom: 5, ts: Date.now() }); }} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* PYTHIA */}
+        <div className="relative group">
+          <button onClick={() => { setShowChat(!showChat); setShowPythia(false); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showChat ? 'bg-[#2df5c8]/20' : 'hover:bg-white/10'}`} title="Ask PYTHIA (/whatif …)">
+            <MessageSquare className={`w-4 h-4 ${showChat ? 'text-[#2df5c8]' : 'text-white/60'}`} />
+          </button>
+          <AnimatePresence>
+            {showChat && (
+              <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-96 h-[460px]">
+                <div className="glass-panel h-full overflow-hidden pointer-events-auto">
+                  <ChatBox />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        <div className="relative group">
+          <button onClick={() => { setShowIntel(!showIntel); setShowMarkets(false); setShowAlerts(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showIntel ? 'bg-[var(--cyan-primary)]/20' : 'hover:bg-white/10'}`}>
             <Radar className={`w-4 h-4 ${showIntel ? 'text-[var(--cyan-primary)]' : 'text-white/60'}`} />
           </button>
           {/* OSINT / Recon Panel Slideout */}
@@ -952,7 +1003,7 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowMarkets(!showMarkets); setShowIntel(false); setShowAlerts(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showMarkets ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowMarkets(!showMarkets); setShowIntel(false); setShowAlerts(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showMarkets ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`}>
             <BarChart3 className={`w-4 h-4 ${showMarkets ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
           </button>
           {/* Markets Panel Slideout */}
@@ -966,7 +1017,7 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowAlerts(!showAlerts); setShowIntel(false); setShowMarkets(false); setShowEntityGraph(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showAlerts ? 'bg-[#FF3D3D]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowAlerts(!showAlerts); setShowIntel(false); setShowMarkets(false); setShowEntityGraph(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showAlerts ? 'bg-[#FF3D3D]/20' : 'hover:bg-white/10'}`}>
             <AlertTriangle className={`w-4 h-4 ${showAlerts ? 'text-[#FF3D3D]' : 'text-white/60'}`} />
           </button>
           {/* Alerts Panel Slideout */}
@@ -1263,6 +1314,11 @@ export default function Dashboard() {
 
       {/* Keyboard Shortcuts Overlay */}
       <KeyboardShortcuts />
+
+      {/* PYTHIA WORLD TICKER */}
+      <div className="absolute bottom-[34px] left-0 right-0 z-[199] pointer-events-none">
+        <HeadlineTicker />
+      </div>
 
       {/* ── GLOBAL STATUS TICKER (bottom) ── */}
       <GlobalStatusBar />
