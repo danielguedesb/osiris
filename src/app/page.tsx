@@ -327,12 +327,17 @@ export default function Dashboard() {
   }, []);
 
   // ── SHARED FETCH UTILITY (Fixes #107 — single definition, not 3 copies) ──
+  // Per-URL failure backoff (2s -> 60s cap, reset on success)
+  const fetchBackoffRef = useRef<Record<string, { fails: number; next: number }>>({});
   const fetchEndpoint = useCallback(async (url: string, transform?: (d: any) => any, options?: RequestInit) => {
     if (typeof document !== 'undefined' && document.hidden) return;
+    const bo = fetchBackoffRef.current[url];
+    if (bo && Date.now() < bo.next) return;
     try {
       // Force the browser to bypass its local disk cache for real-time data
       const res = await fetch(url, { ...options, cache: 'no-store' });
       if (res.ok) {
+        delete fetchBackoffRef.current[url];
         const json = await res.json();
         const d = transform ? transform(json) : json;
         dataRef.current = { ...dataRef.current, ...d };
@@ -340,6 +345,8 @@ export default function Dashboard() {
         setBackendStatus('connected');
       }
     } catch (e) {
+      const fails = (fetchBackoffRef.current[url]?.fails ?? 0) + 1;
+      fetchBackoffRef.current[url] = { fails, next: Date.now() + Math.min(60_000, 1_000 * 2 ** fails) };
       console.warn('[OSIRIS] Suppressed error:', e instanceof Error ? e.message : e);
       setBackendStatus('error');
     }
