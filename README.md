@@ -29,7 +29,7 @@ Osiris is a production-grade OSINT platform that provides situational awareness 
 |--------|------------|---------|
 | **Aviation** | Commercial, Private, Military, Jets | OpenSky Network |
 | **Maritime** | 39 Global Ports, 10 Chokepoints | Static Naval Intel |
-| **CCTV** | 2,000+ Cameras | TfL, WSDOT, Caltrans, NYC DOT, VicRoads + more |
+| **CCTV** | 17,000+ Cameras | TfL, WSDOT, Caltrans, ODOT, MDOT, HK Transport Dept, Taiwan THB, NZTA + more |
 | **Seismic** | Real-time M2.5+ | USGS Earthquake API |
 | **Fires** | Active Hotspots | NASA FIRMS |
 | **News** | 24/7 Live Streams | 25+ Global Broadcasters |
@@ -158,8 +158,8 @@ CasaOS and API-key guide.
 **Prebuilt image (GHCR)** — skip the build and pull it directly:
 
 ```bash
-docker pull ghcr.io/aiacos/osiris:latest
-docker run -d -p 3000:3000 --env-file .env ghcr.io/aiacos/osiris:latest
+docker pull ghcr.io/simplifaisoul/osiris:latest
+docker run -d -p 3000:3000 --env-file .env ghcr.io/simplifaisoul/osiris:latest
 ```
 
 **Custom port** — the container always listens on `3000`; set `OSIRIS_PORT` in

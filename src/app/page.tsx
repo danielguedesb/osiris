@@ -3,11 +3,15 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair, Eye, MessageSquare } from 'lucide-react';
+import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Route, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair, Bluetooth, Pentagon, Radio, Eye, MessageSquare } from 'lucide-react';
 import IntelFeed from '@/components/IntelFeed';
 import MarketsPanel from '@/components/MarketsPanel';
 import ScmPanel from '@/components/ScmPanel';
 import SearchBar from '@/components/SearchBar';
+import DirectionsBar, { type RouteResult, type LiveLocation } from '@/components/DirectionsBar';
+import NavigationView from '@/components/NavigationView';
+import FlightWatchPanel, { type WatchedFlight, type FlightTelemetry, type AircraftDetail, type Airport } from '@/components/FlightWatchPanel';
+import type { NavProgress } from '@/lib/navigation';
 import ScaleBar from '@/components/ScaleBar';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import SharePanel from '@/components/SharePanel';
@@ -15,9 +19,11 @@ import ViewPresets from '@/components/ViewPresets';
 import KeyboardShortcuts from '@/components/KeyboardShortcuts';
 import GlobalStatusBar from '@/components/GlobalStatusBar';
 import LiveAlerts from '@/components/LiveAlerts';
-
+import WorldRemote from '@/components/WorldRemote';
+import ArcGISPanel from '@/components/ArcGISPanel';
 const OsirisMap = dynamic(() => import('@/components/OsirisMap'), { ssr: false });
 const LayerPanel = dynamic(() => import('@/components/LayerPanel'));
+const SpaceCam = dynamic(() => import('@/components/SpaceCam'), { ssr: false });
 const CameraViewer = dynamic(() => import('@/components/CameraViewer'));
 const OsintPanel = dynamic(() => import('@/components/OsintPanel'));
 const EntityGraphPanel = dynamic(() => import('@/components/EntityGraphPanel'));
@@ -110,12 +116,100 @@ export default function Dashboard() {
   const [showAlerts, setShowAlerts] = useState(false);
   const [showPythia, setShowPythia] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  const [showSpaceCam, setShowSpaceCam] = useState(false);
   const [showScmPanel, setShowScmPanel] = useState(true);
   const [showIntel, setShowIntel] = useState(false);
   const [showEntityGraph, setShowEntityGraph] = useState(false);
   const [showDesktopSearch, setShowDesktopSearch] = useState(false);
+  const [showDirections, setShowDirections] = useState(false);
+  const [activeRoute, setActiveRoute] = useState<
+    (RouteResult & {
+      from: { lat: number; lng: number };
+      to: { lat: number; lng: number };
+      alternates?: Array<{ type: 'LineString'; coordinates: [number, number][] }>;
+      activeSegment?: [number, number][] | null;
+    }) | null
+  >(null);
+  const [liveLocation, setLiveLocation] = useState<LiveLocation | null>(null);
+  const [followUser, setFollowUser] = useState(false);
+  const [navSession, setNavSession] = useState<
+    { route: RouteResult; label: string; key: number } | null
+  >(null);
+  const [navProgress, setNavProgress] = useState<NavProgress | null>(null);
+  const [watchedFlights, setWatchedFlights] = useState<WatchedFlight[]>([]);
+  const [aircraftAirports, setAircraftAirports] = useState<Record<string, Airport[]>>({});
+
+  // The popup lives in raw map HTML, so it hands aircraft over through a global.
+  useEffect(() => {
+    (window as unknown as { osirisWatchFlight?: (f: WatchedFlight) => void }).osirisWatchFlight = (f) => {
+      if (!f?.icao24) return;
+      setWatchedFlights((prev) =>
+        prev.some((w) => w.icao24 === f.icao24) ? prev : [...prev, f].slice(-6));
+    };
+  }, []);
+
+  const removeWatched = useCallback((icao24: string) => {
+    setWatchedFlights((prev) => prev.filter((w) => w.icao24 !== icao24));
+    setAircraftAirports((prev) => {
+      const next = { ...prev };
+      delete next[icao24];
+      return next;
+    });
+  }, []);
+
+  const handleAircraftDetail = useCallback((icao24: string, detail: AircraftDetail | null) => {
+    const ports = [detail?.origin, detail?.destination]
+      .filter((a): a is Airport => Boolean(a && Number.isFinite(a.lat) && Number.isFinite(a.lng)));
+    setAircraftAirports((prev) => (ports.length ? { ...prev, [icao24]: ports } : prev));
+  }, []);
+
+  // Telemetry for watched aircraft, refreshed from whatever the feed last gave us.
+  const watchTelemetry = useMemo(() => {
+    const out: Record<string, FlightTelemetry> = {};
+    if (!watchedFlights.length) return out;
+    const buckets = [
+      data?.commercial_flights, data?.private_flights,
+      data?.private_jets, data?.military_flights,
+    ];
+    const wanted = new Set(watchedFlights.map((w) => w.icao24));
+    for (const bucket of buckets) {
+      for (const f of bucket || []) {
+        if (f?.icao24 && wanted.has(f.icao24)) {
+          out[f.icao24] = {
+            lat: f.lat, lng: f.lng, alt: f.alt,
+            speed_knots: f.speed_knots, heading: f.heading,
+            grounded: f.grounded, squawk: f.squawk,
+          };
+        }
+      }
+    }
+    return out;
+  }, [watchedFlights, data]);
+
+  // A navigation session owns its own position watch. The planner's watch dies
+  // with the planner when guidance takes over the panel, so guidance cannot
+  // depend on it — without this the banner sits on "waiting for a fix" forever.
+  useEffect(() => {
+    if (!navSession) return;
+    if (typeof navigator === 'undefined' || !navigator.geolocation) return;
+    const id = navigator.geolocation.watchPosition(
+      (pos) => setLiveLocation({
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+        heading: pos.coords.heading,
+      }),
+      () => { /* the view already explains the HTTPS requirement */ },
+      { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 },
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [navSession]);
+  const [showRemote, setShowRemote] = useState(false);
+  const [showArcGIS, setShowArcGIS] = useState(false);
+  const [arcgisLayers, setArcgisLayers] = useState<Array<{ id: string; title: string; url: string; geojson: any; color: string; visible: boolean; opacity: number }>>([]);
+  const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number; bounds?: { west: number; south: number; east: number; north: number } } | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [mobilePanel, setMobilePanel] = useState<'layers'|'markets'|'intel'|'search'|'recon'|null>(null);
+  const [mobilePanel, setMobilePanel] = useState<'layers'|'markets'|'intel'|'search'|'recon'|'remote'|null>(null);
   const [mapProjection, setMapProjection] = useState<'globe'|'mercator'>('globe');
   const [mapStyle, setMapStyle] = useState<'dark'|'satellite'>('dark');
   const [sweepData, setSweepData] = useState<any>(null);
@@ -150,7 +244,6 @@ export default function Dashboard() {
     balloons: false,
     cctv: true,
     live_news: true,
-    news_intel: true,
     earthquakes: true,
     fires: false,
     weather: false,
@@ -158,7 +251,6 @@ export default function Dashboard() {
     infrastructure: false,
     global_incidents: true,
     war_alerts: false,
-    gps_jamming: false,
     day_night: true,
     cables: true,
     sdk_sea: true,
@@ -168,7 +260,13 @@ export default function Dashboard() {
     malware: false,
     predictions: true,
     predictions_all: false,
+    cyber_attacks: false,
+    gdelt_events: false,
+    cf_outages: false,
+    cf_attacks: false,
   });
+  // Server-side capability flags — gate layers that need credentials.
+  const [capabilities, setCapabilities] = useState<Record<string, boolean>>({});
   const [liveFeedUrl, setLiveFeedUrl] = useState<string | null>(null);
   const [liveFeedName, setLiveFeedName] = useState('');
   const [liveFeedEmbedAllowed, setLiveFeedEmbedAllowed] = useState(true);
@@ -194,6 +292,13 @@ export default function Dashboard() {
         return next;
       });
     }
+
+    // Probe which credential-gated feeds this deployment has configured, so the
+    // layer panel can hide toggles that could never return data.
+    fetch('/api/cloudflare-radar?probe=1')
+      .then(r => (r.ok ? r.json() : null))
+      .then(p => { if (p) setCapabilities(c => ({ ...c, cloudflare: !!p.configured })); })
+      .catch(() => { /* leave the layer hidden */ });
 
     // Delay geolocation until map is ready (after splash screen clears)
     const geoTimer = setTimeout(() => {
@@ -245,12 +350,12 @@ export default function Dashboard() {
       if (e.key === 'm') setShowMarkets(p => !p);
       if (e.key === 'c') setShowScmPanel(p => !p);
       if (e.key === 'i') setShowIntel(p => !p);
-      if (e.key === 's') { setShowDesktopSearch(p => !p); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); }
+      if (e.key === 's') { setShowDesktopSearch(p => !p); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false); }
       if (e.key === 'r') setFlyToLocation({ lat: 20, lng: 0, ts: Date.now() });
       if (e.key === 'g') setMapProjection(p => p === 'globe' ? 'mercator' : 'globe');
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault();
-        setShowDesktopSearch(true); setShowIntel(false); setShowMarkets(false); setShowAlerts(false);
+        setShowDesktopSearch(true); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false);
       }
     };
     const fsHandler = () => setIsFullscreen(!!document.fullscreenElement);
@@ -327,12 +432,22 @@ export default function Dashboard() {
   }, []);
 
   // ── SHARED FETCH UTILITY (Fixes #107 — single definition, not 3 copies) ──
+  /* `skipWhenHidden` is for background polling only — skipping a *user-initiated*
+     load (a layer toggle, or first paint in a background tab) leaves the caller
+     believing it fetched, so the layer stays empty until a full reload.
+     Returns whether data actually landed, so callers can retry. */
+  
   // Per-URL failure backoff (2s -> 60s cap, reset on success)
   const fetchBackoffRef = useRef<Record<string, { fails: number; next: number }>>({});
-  const fetchEndpoint = useCallback(async (url: string, transform?: (d: any) => any, options?: RequestInit) => {
-    if (typeof document !== 'undefined' && document.hidden) return;
+  const fetchEndpoint = useCallback(async (
+    url: string,
+    transform?: (d: any) => any,
+    options?: RequestInit,
+    { skipWhenHidden = false }: { skipWhenHidden?: boolean } = {},
+  ): Promise<boolean> => {
+    if (skipWhenHidden && typeof document !== 'undefined' && document.hidden) return false;
     const bo = fetchBackoffRef.current[url];
-    if (bo && Date.now() < bo.next) return;
+    if (bo && Date.now() < bo.next) return false;
     try {
       // Force the browser to bypass its local disk cache for real-time data
       const res = await fetch(url, { ...options, cache: 'no-store' });
@@ -343,12 +458,15 @@ export default function Dashboard() {
         dataRef.current = { ...dataRef.current, ...d };
         setDataVersion(v => v + 1);
         setBackendStatus('connected');
+        return true;
       }
+      return false;
     } catch (e) {
       const fails = (fetchBackoffRef.current[url]?.fails ?? 0) + 1;
       fetchBackoffRef.current[url] = { fails, next: Date.now() + Math.min(60_000, 1_000 * 2 ** fails) };
       console.warn('[OSIRIS] Suppressed error:', e instanceof Error ? e.message : e);
       setBackendStatus('error');
+      return false;
     }
   }, []);
 
@@ -369,7 +487,17 @@ export default function Dashboard() {
     const eqTransform = (data: any) => ({ earthquakes: (data.features || []).map((f: any) => ({ id: f.id, lat: f.geometry?.coordinates?.[1] || 0, lng: f.geometry?.coordinates?.[0] || 0, depth: f.geometry?.coordinates?.[2] || 0, magnitude: f.properties?.mag, place: f.properties?.place, time: f.properties?.time, url: f.properties?.url, tsunami: f.properties?.tsunami, type: f.properties?.type, felt: f.properties?.felt, alert: f.properties?.alert })) });
     fetchEndpoint(eqUrl, eqTransform);
     fetchEndpoint('/api/news');
-    const marketTimer = setTimeout(() => fetchEndpoint('/api/markets', d => ({ markets: d })), 800);
+    /* A cold start can time out every upstream quote and return an all-empty
+       feed. Waiting a full poll interval to find out leaves the panel blank for
+       15 minutes, so retry a few times up-front until instruments actually land. */
+    const marketRetries: ReturnType<typeof setTimeout>[] = [];
+    const loadMarkets = async (attempt = 0) => {
+      await fetchEndpoint('/api/markets', d => ({ markets: d }));
+      if ((dataRef.current.markets?.count || 0) === 0 && attempt < 3) {
+        marketRetries.push(setTimeout(() => loadMarkets(attempt + 1), 15000));
+      }
+    };
+    const marketTimer = setTimeout(() => loadMarkets(), 800);
 
     // Priority 2: Space Weather (needed for MarketsPanel)
     const spaceTimer = setTimeout(async () => {
@@ -381,12 +509,13 @@ export default function Dashboard() {
 
     // Polling — OPTIMIZED intervals to minimize edge requests
     const intervals = [
-      setInterval(() => fetchEndpoint(eqUrl, eqTransform), 900000),  // 15 min (was 5)
-      setInterval(() => fetchEndpoint('/api/news'), 1800000),        // 30 min (was 10)
-      setInterval(() => fetchEndpoint('/api/markets', d => ({ markets: d })), 900000), // 15 min (was 5)
+      setInterval(() => fetchEndpoint(eqUrl, eqTransform, undefined, { skipWhenHidden: true }), 900000),  // 15 min (was 5)
+      setInterval(() => fetchEndpoint('/api/news', undefined, undefined, { skipWhenHidden: true }), 1800000),        // 30 min (was 10)
+      setInterval(() => fetchEndpoint('/api/markets', d => ({ markets: d }), undefined, { skipWhenHidden: true }), 900000), // 15 min (was 5)
     ];
     return () => {
       clearTimeout(marketTimer);
+      marketRetries.forEach(clearTimeout);
       clearTimeout(spaceTimer);
       intervals.forEach(clearInterval);
     };
@@ -478,6 +607,36 @@ export default function Dashboard() {
       layerFetchedRef.current.add('malware');
     }
 
+    // Live Cyber Attacks (animated arcs)
+    if ((activeLayers as any).cyber_attacks && !layerFetchedRef.current.has('cyber_attacks')) {
+      fetchEndpoint('/api/cyber-attacks', d => ({ cyber_attacks: d.attacks }));
+      layerFetchedRef.current.add('cyber_attacks');
+    }
+
+    /* Mark before awaiting so a re-render mid-flight cannot double-fetch, then
+       release the mark if nothing landed — otherwise one failed request leaves
+       the layer permanently empty. */
+    const loadLayerOnce = (key: string, url: string, transform: (d: any) => any) => {
+      if (layerFetchedRef.current.has(key)) return;
+      layerFetchedRef.current.add(key);
+      fetchEndpoint(url, transform).then(ok => {
+        if (!ok) layerFetchedRef.current.delete(key);
+      });
+    };
+
+    // GDELT 2.0 geocoded events
+    if ((activeLayers as any).gdelt_events) {
+      loadLayerOnce('gdelt_events', '/api/gdelt-events?limit=600', d => ({ gdelt_events: d.events }));
+    }
+
+    // Cloudflare Radar — one request backs both layers
+    if ((activeLayers as any).cf_outages || (activeLayers as any).cf_attacks) {
+      loadLayerOnce('cloudflare_radar', '/api/cloudflare-radar', d => ({
+        cf_outages: d.outages ?? [],
+        cf_attack_origins: d.attack_origins ?? [],
+      }));
+    }
+
 
   }, [activeLayers]);
 
@@ -496,6 +655,13 @@ export default function Dashboard() {
     }
     if (activeLayers.maritime) {
       intervals.push(setInterval(() => fetchEndpoint('/api/maritime', d => ({ maritime_ports: d.ports, maritime_chokepoints: d.chokepoints, maritime_ships: d.ships })), 10000)); // 10s
+    }
+    if ((activeLayers as any).cyber_attacks) {
+      intervals.push(setInterval(() => {
+        layerFetchedRef.current.delete('cyber_attacks');
+        fetchEndpoint('/api/cyber-attacks', d => ({ cyber_attacks: d.attacks }));
+        layerFetchedRef.current.add('cyber_attacks');
+      }, 10000)); // 10s — rapid refresh
     }
     return () => intervals.forEach(clearInterval);
   }, [activeLayers, fetchEndpoint]);
@@ -612,7 +778,7 @@ export default function Dashboard() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 0.6 }}
               transition={{ delay: 0.8, duration: 0.5 }}
-              className="absolute top-6 left-6 z-[2] font-mono text-[10px] tracking-[0.3em] text-[var(--gold-primary)]"
+              className="absolute top-6 left-6 z-[2] font-mono text-[12px] tracking-[0.3em] text-[var(--gold-primary)]"
             >
               V4.2
             </motion.div>
@@ -709,7 +875,7 @@ export default function Dashboard() {
                 transition={{ delay: 1.2, duration: 0.8, ease: 'easeInOut' }}
                 className="overflow-hidden whitespace-nowrap"
               >
-                <p className="text-[10px] md:text-[11px] font-mono tracking-[0.5em] text-[var(--gold-primary)]" style={{ opacity: 0.8 }}>
+                <p className="text-[12px] md:text-[11px] font-mono tracking-[0.5em] text-[var(--gold-primary)]" style={{ opacity: 0.8 }}>
                   GLOBAL INTELLIGENCE PLATFORM
                 </p>
               </motion.div>
@@ -741,7 +907,7 @@ export default function Dashboard() {
                     initial={{ opacity: 0 }}
                     animate={{ opacity: [0, 1, 1, 0] }}
                     transition={{ delay: stage.delay, duration: 0.6, times: [0, 0.1, 0.7, 1] }}
-                    className="absolute text-[9px] font-mono tracking-[0.25em]"
+                    className="absolute text-[11px] font-mono tracking-[0.25em]"
                     style={{ color: i === 3 ? 'var(--cyan-primary)' : 'var(--text-muted)' }}
                   >
                     {stage.text}
@@ -802,9 +968,100 @@ export default function Dashboard() {
           scanTargets={scanTargets}
           demoMode={demoMode}
           theme={osirisTheme}
+          arcgisLayers={arcgisLayers.filter(l => l.visible).map(l => ({ id: l.id, title: l.title, geojson: l.geojson, color: l.color, opacity: l.opacity }))}
+          onMapCenter={setMapCenter}
+          route={activeRoute}
+          userLocation={
+            navSession && navProgress
+              ? { lat: navProgress.snapped[1], lng: navProgress.snapped[0], accuracy: liveLocation?.accuracy, heading: liveLocation?.heading }
+              : liveLocation
+          }
+          followUser={followUser}
+          onFollowInterrupt={() => setFollowUser(false)}
+          navigating={Boolean(navSession)}
+          aircraftAirports={aircraftAirports}
         />
       </ErrorBoundary>
 
+      {/* ── DIRECTIONS — opens beside the right-hand tool rail ── */}
+      <div
+        className="absolute top-3 z-[400] w-[min(92vw,372px)] pointer-events-auto"
+        style={isMobile ? { left: '50%', transform: 'translateX(-50%)' } : { right: '56px' }}
+      >
+        {navSession ? (
+          <motion.div initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }}>
+            <NavigationView
+              key={navSession.key}
+              route={navSession.route}
+              destinationLabel={navSession.label}
+              fix={liveLocation}
+              onProgress={setNavProgress}
+              following={followUser}
+              onRecenter={() => setFollowUser(true)}
+              onExit={() => { setNavSession(null); setNavProgress(null); setFollowUser(false); }}
+              onReroute={async (fromPt) => {
+                // Re-plan from where the driver actually is, to the same destination.
+                const dest = navSession.route.geometry.coordinates.at(-1)!;
+                try {
+                  const res = await fetch(
+                    `/api/directions?from=${fromPt.lat},${fromPt.lng}&to=${dest[1]},${dest[0]}&mode=auto`,
+                  );
+                  const data = await res.json();
+                  if (res.ok && !data.error) {
+                    setNavSession((n) => (n ? { ...n, route: data, key: Date.now() } : n));
+                    setActiveRoute({ ...data, from: fromPt, to: { lat: dest[1], lng: dest[0] } });
+                  }
+                } catch { /* keep the old route rather than dropping guidance */ }
+              }}
+            />
+          </motion.div>
+        ) : null}
+
+        {/* The planner stays mounted underneath a running session: unmounting it
+            would discard the route you are driving, so ending guidance would
+            drop you into an empty form instead of back onto your route. */}
+        {showDirections && (
+          <motion.div
+            initial={{ opacity: 0, y: -12 }}
+            animate={{ opacity: navSession ? 0 : 1, y: 0 }}
+            className={navSession ? 'pointer-events-none h-0 overflow-hidden' : ''}
+            aria-hidden={Boolean(navSession)}
+          >
+            <DirectionsBar
+              center={mapCenter ? { lat: mapCenter.lat, lng: mapCenter.lng } : null}
+              onRoute={(r) => setActiveRoute(r)}
+              onLiveLocation={setLiveLocation}
+              onFollowChange={setFollowUser}
+              onActiveSegment={(seg) => setActiveRoute((r) => (r ? { ...r, activeSegment: seg } : r))}
+              onStartNavigation={(r, label) => {
+                setNavSession({ route: r, label, key: Date.now() });
+                setFollowUser(true);
+              }}
+              onLocate={(lat, lng, zoom) => setFlyToLocation({ lat, lng, zoom, ts: Date.now() })}
+              onClose={() => { setShowDirections(false); setActiveRoute(null); }}
+            />
+          </motion.div>
+        )}
+      </div>
+
+
+      {/* ── FLIGHT WATCH ── */}
+      {watchedFlights.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, x: -16 }} animate={{ opacity: 1, x: 0 }}
+          className="absolute top-3 z-[380] w-[min(92vw,290px)] pointer-events-auto
+                     max-h-[calc(100vh-180px)] overflow-y-auto styled-scrollbar"
+          style={{ left: isMobile ? '12px' : '120px' }}
+        >
+          <FlightWatchPanel
+            watched={watchedFlights}
+            telemetry={watchTelemetry}
+            onRemove={removeWatched}
+            onLocate={(lat, lng) => setFlyToLocation({ lat, lng, zoom: 8, ts: Date.now() })}
+            onDetail={handleAircraftDetail}
+          />
+        </motion.div>
+      )}
 
       {/* ── MAP VIEW CONTROLS ── */}
       <motion.div
@@ -818,7 +1075,7 @@ export default function Dashboard() {
           <div className="flex items-center rounded-xl overflow-hidden border border-[var(--border-primary)] bg-[var(--bg-panel)] backdrop-blur-2xl shadow-[0_4px_24px_rgba(0,0,0,0.5)]">
             <button
               onClick={() => setMapProjection('globe')}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[9px] font-mono tracking-wider transition-all duration-200 ${
+              className={`flex items-center gap-1.5 px-3 py-2 text-[11px] font-mono tracking-wider transition-all duration-200 ${
                 mapProjection === 'globe'
                   ? 'bg-[var(--cyan-primary)]/15 text-[var(--cyan-primary)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
@@ -831,7 +1088,7 @@ export default function Dashboard() {
             <div className="w-px h-4 bg-[var(--border-primary)]" />
             <button
               onClick={() => setMapProjection('mercator')}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[9px] font-mono tracking-wider transition-all duration-200 ${
+              className={`flex items-center gap-1.5 px-3 py-2 text-[11px] font-mono tracking-wider transition-all duration-200 ${
                 mapProjection === 'mercator'
                   ? 'bg-[var(--gold-primary)]/15 text-[var(--gold-primary)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
@@ -847,7 +1104,7 @@ export default function Dashboard() {
           <div className="flex items-center rounded-xl overflow-hidden border border-[var(--border-primary)] bg-[var(--bg-panel)] backdrop-blur-2xl shadow-[0_4px_24px_rgba(0,0,0,0.5)]">
             <button
               onClick={() => setMapStyle('dark')}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[9px] font-mono tracking-wider transition-all duration-200 ${
+              className={`flex items-center gap-1.5 px-3 py-2 text-[11px] font-mono tracking-wider transition-all duration-200 ${
                 mapStyle === 'dark'
                   ? 'bg-[var(--cyan-primary)]/15 text-[var(--cyan-primary)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
@@ -860,7 +1117,7 @@ export default function Dashboard() {
             <div className="w-px h-4 bg-[var(--border-primary)]" />
             <button
               onClick={() => setMapStyle('satellite')}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[9px] font-mono tracking-wider transition-all duration-200 ${
+              className={`flex items-center gap-1.5 px-3 py-2 text-[11px] font-mono tracking-wider transition-all duration-200 ${
                 mapStyle === 'satellite'
                   ? 'bg-[var(--alert-green)]/15 text-[var(--alert-green)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
@@ -891,61 +1148,60 @@ export default function Dashboard() {
           </svg>
           <div className="flex flex-col items-start gap-0.5">
             <h1 className="text-lg md:text-xl font-bold tracking-[0.4em] text-[#D4AF37] font-mono">OSIRIS</h1>
-            <span className="text-[8px] md:text-[9px] font-mono tracking-[0.2em] opacity-80 uppercase text-[#D4AF37]">GLOBAL INTELLIGENCE COMMAND</span>
+            <span className="text-[10px] md:text-[11px] font-mono tracking-[0.2em] opacity-80 uppercase text-[#D4AF37]">OPEN SOURCE INTELLIGENCE</span>
           </div>
         </div>
         <div className="flex items-center gap-3 mt-1.5 pl-[44px] min-w-0 pr-4">
-          <span className="text-[5px] md:text-[6px] text-[var(--text-muted)] font-mono tracking-[0.2em] md:tracking-[0.3em] uppercase opacity-40 truncate">
-            POWERED BY OSIRIS OPEN SOURCE INTELLIGENCE <span className="hidden md:inline">· C2 ENGINE: PHYSICAL COMMAND CORE · SENSORS: ORBITAL LATTICE · NET: LYCAN NETWORK</span>
+          <span className="text-[10px] md:text-[10px] text-[var(--text-muted)] font-mono tracking-[0.2em] md:tracking-[0.3em] uppercase opacity-40 truncate">
+            REAL-TIME GLOBAL MONITORING <span className="hidden md:inline">· FLIGHTS · MARITIME · SATELLITES · CCTV · WEATHER · CYBER THREATS</span>
           </span>
         </div>
       </motion.div>
 
 
-      {/* ── TOP-RIGHT STATUS (desktop) — C2 DISPLAY ── */}
-      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 3 }} className="status-bar-desktop absolute top-4 right-6 z-[200] pointer-events-none flex items-center gap-4 text-[9px] font-mono tracking-widest text-[var(--text-muted)]">
+      {/* ── TOP-RIGHT STATUS (desktop) ── */}
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 3 }} className="status-bar-desktop absolute top-4 right-6 z-[200] pointer-events-none flex items-center gap-3 text-[11px] font-mono tracking-widest text-[var(--text-muted)]">
 
         <span className="hidden lg:inline-flex items-center gap-1.5">
           <ZuluClock />
         </span>
 
-        <span className="flex items-center gap-1">SYS: <span className={backendStatus === 'connected' ? 'text-[var(--alert-green)]' : 'text-[var(--alert-red)]'}>{backendStatus.toUpperCase()}</span></span>
+        <span className="flex items-center gap-1" title="Backend connection status">STATUS: <span className={backendStatus === 'connected' ? 'text-[var(--alert-green)]' : 'text-[var(--alert-red)]'}>{backendStatus === 'connected' ? 'LIVE' : backendStatus.toUpperCase()}</span></span>
 
-        {spaceWeather && <span className="hidden lg:inline">SOLAR: <span style={{ color: spaceWeather.storm_color, fontWeight: 700 }}>Kp{spaceWeather.kp_index}</span></span>}
-
-        <span className="hidden lg:inline-flex items-center gap-1">
+        <span className="hidden lg:inline-flex items-center gap-1" title="Number of active data layers">
           <span className="text-[var(--cyan-primary)] font-bold">{Object.values(activeLayers).filter(Boolean).length}</span>
-          <span className="text-[var(--text-muted)]/60">FEEDS</span>
+          <span className="opacity-60">LAYERS</span>
         </span>
 
         <UptimeClock />
-        <span className="text-[10px] font-bold tracking-[0.2em] text-[var(--text-muted)] opacity-50 ml-2">V.4.1</span>
+        <span className="hidden lg:inline-flex items-center gap-1" title="Tracked entities on map">
+          <ActiveEntityCount data={data} />
+          <span className="opacity-60">ENTITIES</span>
+        </span>
+
+        {spaceWeather && <span className="hidden lg:inline" title={`Geomagnetic Storm Index — Kp${spaceWeather.kp_index}`}>SOLAR: <span style={{ color: spaceWeather.storm_color, fontWeight: 700 }}>Kp{spaceWeather.kp_index}</span></span>}
+
+        <span className="text-[12px] font-bold tracking-[0.2em] text-[var(--text-muted)] opacity-50">V.4.1</span>
 
         <PythiaStatus compact />
         
         <TokenPanel />
 
-        <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' rel='noopener noreferrer' className="pointer-events-auto glass-panel px-3 py-1.5 flex items-center gap-1.5 text-[8px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10 ml-4 shadow-[0_0_10px_rgba(255,215,0,0.1)]">
+        <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' rel='noopener noreferrer' className="pointer-events-auto glass-panel px-3 py-1.5 flex items-center gap-1.5 text-[10px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10 ml-3 shadow-[0_0_10px_rgba(255,215,0,0.1)]">
           <div className="w-1.5 h-1.5 rounded-full bg-[var(--gold-primary)] animate-osiris-pulse" />
-          <span className="text-[var(--gold-primary)] font-bold">SUPPORT PROJECT</span>
+          <span className="text-[var(--gold-primary)] font-bold">SUPPORT</span>
         </a>
       </motion.div>
 
       {/* ── MOBILE: Compact top status ── */}
-      {isMobile && (
+      {/* The route planner claims the top of a phone screen; leaving this in
+          place would put the support badge underneath the destination field. */}
+      {isMobile && !showDirections && !navSession && (
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.5 }} className="absolute top-3 right-3 z-[200] pointer-events-auto flex items-center gap-2">
           <TokenPanel />
-          <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' rel='noopener noreferrer' className="glass-panel px-2 py-1 flex items-center gap-1.5 text-[7px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10">
+          <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' rel='noopener noreferrer' className="glass-panel px-2 py-1 flex items-center gap-1.5 text-[10px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10">
             <div className="w-1 h-1 rounded-full bg-[var(--gold-primary)] animate-osiris-pulse" />
-            <span className="text-[var(--gold-primary)] font-bold">SUPPORT PROJECT</span>
-          </a>
-        </motion.div>
-      )}
-      {isMobile && (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.5 }} className="absolute top-3 right-3 z-[200] pointer-events-auto flex items-center gap-2">
-          <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' className="glass-panel px-2 py-1 flex items-center gap-1.5 text-[7px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10">
-            <div className="w-1 h-1 rounded-full bg-[var(--gold-primary)] animate-osiris-pulse" />
-            <span className="text-[var(--gold-primary)] font-bold">SUPPORT PROJECT</span>
+            <span className="text-[var(--gold-primary)] font-bold">SUPPORT</span>
           </a>
         </motion.div>
       )}
@@ -953,7 +1209,7 @@ export default function Dashboard() {
 
 
       {/* ── NEW SIDEBAR (Root Level) ── */}
-      {showLayers && !isMobile && <LayerPanel data={data} activeLayers={activeLayers} setActiveLayers={setActiveLayers} theme={osirisTheme} setTheme={setOsirisTheme} />}
+      {showLayers && !isMobile && <LayerPanel data={data} activeLayers={activeLayers} setActiveLayers={setActiveLayers} theme={osirisTheme} setTheme={setOsirisTheme} capabilities={capabilities} />}
 
 
 
@@ -990,10 +1246,10 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowIntel(!showIntel); setShowMarkets(false); setShowAlerts(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showIntel ? 'bg-[var(--cyan-primary)]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowIntel(!showIntel); setShowMarkets(false); setShowAlerts(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showIntel ? 'bg-[var(--cyan-primary)]/20' : 'hover:bg-white/10'}`} title="OSINT Recon — IP lookup, network sweep, geolocation">
             <Radar className={`w-4 h-4 ${showIntel ? 'text-[var(--cyan-primary)]' : 'text-white/60'}`} />
           </button>
-          {/* OSINT / Recon Panel Slideout */}
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">RECON</span>
           <AnimatePresence>
             {showIntel && (
               <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
@@ -1010,10 +1266,24 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowMarkets(!showMarkets); setShowIntel(false); setShowAlerts(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showMarkets ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowIntel(false); setShowAlerts(false); setShowMarkets(false); setShowPythia(false); setShowChat(false); setShowSpaceCam(v => !v); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showSpaceCam ? 'bg-[#00E5FF]/20' : 'hover:bg-white/10'}`} title="Live from Space — 24/7 video downlink from the ISS">
+            <Radio className={`w-4 h-4 ${showSpaceCam ? 'text-[#00E5FF]' : 'text-white/60'}`} />
+          </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">SPACE</span>
+          <AnimatePresence>
+            {showSpaceCam && (
+              <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
+                <SpaceCam />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        <div className="relative group">
+          <button onClick={() => { setShowMarkets(!showMarkets); setShowIntel(false); setShowAlerts(false); setShowSpaceCam(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showMarkets ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="Markets — crypto prices, space weather, global indices">
             <BarChart3 className={`w-4 h-4 ${showMarkets ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
           </button>
-          {/* Markets Panel Slideout */}
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">MARKETS</span>
           <AnimatePresence>
             {showMarkets && (
               <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
@@ -1024,10 +1294,10 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowAlerts(!showAlerts); setShowIntel(false); setShowMarkets(false); setShowEntityGraph(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showAlerts ? 'bg-[#FF3D3D]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowAlerts(!showAlerts); setShowIntel(false); setShowMarkets(false); setShowEntityGraph(false); setShowPythia(false); setShowChat(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showAlerts ? 'bg-[#FF3D3D]/20' : 'hover:bg-white/10'}`} title="Live Alerts — earthquakes, conflicts, breaking news">
             <AlertTriangle className={`w-4 h-4 ${showAlerts ? 'text-[#FF3D3D]' : 'text-white/60'}`} />
           </button>
-          {/* Alerts Panel Slideout */}
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">ALERTS</span>
           <AnimatePresence>
             {showAlerts && (
               <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
@@ -1038,19 +1308,82 @@ export default function Dashboard() {
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowEntityGraph(!showEntityGraph); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showEntityGraph ? 'bg-[#D4AF37]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowEntityGraph(!showEntityGraph); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showEntityGraph ? 'bg-[#D4AF37]/20' : 'hover:bg-white/10'}`} title="Entity Graph — link analysis between tracked entities">
             <Network className={`w-4 h-4 ${showEntityGraph ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
           </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">GRAPH</span>
         </div>
 
         <div className="relative group">
-          <button onClick={() => { setShowDesktopSearch(!showDesktopSearch); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowEntityGraph(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showDesktopSearch ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`}>
+          <button onClick={() => { setShowDirections(!showDirections); if (showDirections) { setActiveRoute(null); } setShowDesktopSearch(false); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false); setShowEntityGraph(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showDirections ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="Directions — turn-by-turn routing">
+            <Route className={`w-4 h-4 ${showDirections ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
+          </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">ROUTE</span>
+        </div>
+
+        <div className="relative group">
+          <button onClick={() => { setShowDesktopSearch(!showDesktopSearch); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false); setShowEntityGraph(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showDesktopSearch ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="Search — find locations, cities, coordinates">
             <Search className={`w-4 h-4 ${showDesktopSearch ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
           </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">SEARCH</span>
           <AnimatePresence>
             {showDesktopSearch && (
               <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
                 <SearchBar alwaysExpanded onLocate={(lat, lng, zoom) => { setFlyToLocation({ lat, lng, zoom, ts: Date.now() }); setShowDesktopSearch(false); }} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Separator */}
+        <div className="w-4 h-px bg-white/10 mx-auto" />
+
+        {/* ── ARCGIS INTEL ── */}
+        <div className="relative group">
+          <button onClick={() => { setShowArcGIS(!showArcGIS); setShowRemote(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showArcGIS ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="ArcGIS — search & import geospatial intel layers">
+            <Database className={`w-4 h-4 ${showArcGIS ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
+            {arcgisLayers.length > 0 && <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] flex items-center justify-center rounded-full bg-[var(--gold-primary)] text-black text-[10px] font-mono font-bold leading-none px-0.5">{arcgisLayers.length}</span>}
+          </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">ARCGIS</span>
+          <AnimatePresence>
+            {showArcGIS && (
+              <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-[340px]">
+                <div className="glass-panel p-3 max-h-[70vh] overflow-y-auto styled-scrollbar">
+                  <ArcGISPanel
+                    onImportLayer={(layer) => setArcgisLayers(prev => [...prev.filter(l => l.id !== layer.id), { ...layer, color: layer.color || '#D4AF37', visible: true, opacity: layer.opacity ?? 0.8 }])}
+                    onRemoveLayer={(id) => setArcgisLayers(prev => prev.filter(l => l.id !== id))}
+                    onUpdateLayer={(id, updates) => setArcgisLayers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l))}
+                    importedLayers={arcgisLayers}
+                    mapBounds={mapCenter?.bounds || null}
+                  />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+
+        {/* Separator */}
+        <div className="w-4 h-px bg-white/10 mx-auto" />
+
+        {/* ── WORLD REMOTE ── */}
+        <div className="relative group">
+          <button onClick={() => { setShowRemote(!showRemote); setShowArcGIS(false); setShowIntel(false); setShowMarkets(false); setShowAlerts(false); setShowSpaceCam(false); setShowEntityGraph(false); setShowDesktopSearch(false); }} className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${showRemote ? 'bg-[var(--cyan-primary)]/20' : 'hover:bg-white/10'}`} title="World Remote — control nearby Bluetooth devices (TVs, speakers, AC)">
+            <Bluetooth className={`w-4 h-4 ${showRemote ? 'text-[var(--cyan-primary)]' : 'text-white/60'}`} />
+          </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[10px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">REMOTE</span>
+          <AnimatePresence>
+            {showRemote && (
+              <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="absolute right-12 top-1/2 -translate-y-1/2 w-80">
+                <WorldRemote onClose={() => setShowRemote(false)} onPlaceOnMap={(devs) => {
+                  setScanTargets(prev => {
+                    const ids = new Set(prev.map((t: any) => t.id));
+                    const next = [...prev];
+                    devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: 'BLE' }); });
+                    return next.slice(0, 20);
+                  });
+                  if (devs.length > 0) setFlyToLocation({ lat: devs[0].lat, lng: devs[0].lng, ts: Date.now() });
+                }} />
               </motion.div>
             )}
           </AnimatePresence>
@@ -1080,9 +1413,9 @@ export default function Dashboard() {
                 <div className="flex items-center gap-2">
                   <div className="w-2 h-2 rounded-full bg-[#FF4081] animate-osiris-pulse" />
                   <span className="text-[12px] font-mono font-bold text-white tracking-wider">{liveFeedName}</span>
-                  <span className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 font-mono text-[9px] font-bold">LIVE STREAM</span>
+                  <span className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 font-mono text-[11px] font-bold">LIVE STREAM</span>
                   {!liveFeedEmbedAllowed && (
-                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono text-[9px]">EXTERNAL ONLY</span>
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-mono text-[11px]">EXTERNAL ONLY</span>
                   )}
                 </div>
                 <div className="flex items-center gap-3">
@@ -1150,14 +1483,6 @@ export default function Dashboard() {
 
       {/* ═══ MOBILE UI ═══ */}
       {isMobile && (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.5 }} className="absolute top-3 right-3 z-[200] pointer-events-auto flex items-center gap-2">
-          <a href='https://ko-fi.com/M8D41ZYW4Z' target='_blank' rel='noopener noreferrer' className="glass-panel px-2 py-1 flex items-center gap-1.5 text-[7px] font-mono tracking-widest hover:opacity-80 transition-opacity border-[var(--gold-primary)]/40 bg-[var(--gold-primary)]/10">
-            <div className="w-1 h-1 rounded-full bg-[var(--gold-primary)] animate-osiris-pulse" />
-            <span className="text-[var(--gold-primary)] font-bold">SUPPORT PROJECT</span>
-          </a>
-        </motion.div>
-      )}
-      {isMobile && (
         <>
           {/* Mobile Bottom Navigation */}
           <div className="mobile-nav">
@@ -1168,13 +1493,45 @@ export default function Dashboard() {
                 { id: 'intel' as const, icon: Newspaper, label: 'INTEL' },
                 { id: 'recon' as const, icon: Radar, label: 'RECON' },
                 { id: 'search' as const, icon: Search, label: 'SEARCH' },
-              ].map(tab => (
-                <button key={tab.id} onClick={() => setMobilePanel(mobilePanel === tab.id ? null : tab.id)}
-                  className={`mobile-nav-btn ${mobilePanel === tab.id ? 'active' : ''}`}>
-                  <tab.icon className={`w-4 h-4 ${tab.id === 'recon' ? 'text-[var(--cyan-primary)]' : ''}`} />
-                  <span className={tab.id === 'recon' ? 'text-[var(--cyan-primary)]' : ''}>{tab.label}</span>
-                </button>
-              ))}
+                // Routing was reachable only from the desktop tool rail, so a
+                // phone could not open it at all. It sits next to SEARCH
+                // because both answer "take me somewhere".
+                { id: 'route' as const, icon: Route, label: 'ROUTE' },
+                { id: 'remote' as const, icon: Bluetooth, label: 'REMOTE' },
+              ].map(tab => {
+                // Routing opens the planner at the top of the screen rather than
+                // the bottom drawer — it needs the room above the keyboard, and
+                // guidance has to stay readable while you drive.
+                const isRoute = tab.id === 'route';
+                const active = isRoute ? showDirections || Boolean(navSession) : mobilePanel === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    onClick={() => {
+                      if (isRoute) {
+                        // Mid-drive this must not touch anything: closing the
+                        // planner clears the active route, which would take the
+                        // line off the map underneath a driver. Guidance is
+                        // ended from the navigation view's own exit.
+                        if (navSession) return;
+                        setMobilePanel(null);
+                        setShowDirections((open) => {
+                          if (open) setActiveRoute(null);
+                          return !open;
+                        });
+                        return;
+                      }
+                      setMobilePanel(mobilePanel === tab.id ? null : tab.id);
+                    }}
+                    aria-pressed={active}
+                    disabled={isRoute && Boolean(navSession)}
+                    className={`mobile-nav-btn ${active ? 'active' : ''}`}
+                  >
+                    <tab.icon className={`w-4 h-4 ${tab.id === 'recon' ? 'text-[var(--cyan-primary)]' : ''}`} />
+                    <span className={tab.id === 'recon' ? 'text-[var(--cyan-primary)]' : ''}>{tab.label}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -1190,8 +1547,8 @@ export default function Dashboard() {
                 <div className="mobile-drawer-handle" />
                 <div className="px-3 pb-3">
                   <div className="flex items-center justify-between mb-2">
-                    <span className="hud-text text-[9px] text-[var(--text-primary)]">
-                      {mobilePanel === 'layers' ? 'LAYERS & STATS' : mobilePanel === 'markets' ? 'MARKETS & INTEL' : mobilePanel === 'intel' ? 'INTEL FEED' : mobilePanel === 'recon' ? 'OSIRIS RECON' : 'SEARCH'}
+                    <span className="hud-text text-[11px] text-[var(--text-primary)]">
+                      {mobilePanel === 'layers' ? 'LAYERS & STATS' : mobilePanel === 'markets' ? 'MARKETS & INTEL' : mobilePanel === 'intel' ? 'INTEL FEED' : mobilePanel === 'recon' ? 'OSIRIS RECON' : mobilePanel === 'remote' ? 'WORLD REMOTE' : 'SEARCH'}
                     </span>
                     <button onClick={() => setMobilePanel(null)} className="text-[var(--text-muted)] p-1"><X className="w-4 h-4" /></button>
                   </div>
@@ -1199,14 +1556,14 @@ export default function Dashboard() {
                     <>
                       <div className="glass-panel-sm p-2 mb-2">
                         <div className="grid grid-cols-5 gap-1 text-center">
-                          <div><div className="hud-label" style={{fontSize:'6px'}}>AIR</div><div className="hud-value text-[9px]">{totalFlights.toLocaleString()}</div></div>
-                          <div><div className="hud-label" style={{fontSize:'6px'}}>SAT</div><div className="hud-value text-[9px]">{(data.satellites?.length||0)}</div></div>
-                          <div><div className="hud-label" style={{fontSize:'6px'}}>CAM</div><div className="hud-value text-[9px]">{(data.cameras?.length||0)}</div></div>
-                          <div><div className="hud-label" style={{fontSize:'6px'}}>WX</div><div className="hud-value text-[9px]" style={{color:'var(--accent-weather)'}}>{(data.weather_events?.length||0)}</div></div>
-                          <div><div className="hud-label" style={{fontSize:'6px'}}>NUC</div><div className="hud-value text-[9px]" style={{color:'var(--accent-nuclear)'}}>{(data.infrastructure?.length||0)}</div></div>
+                          <div><div className="hud-label" style={{fontSize:'10px'}}>AIR</div><div className="hud-value text-[11px]">{totalFlights.toLocaleString()}</div></div>
+                          <div><div className="hud-label" style={{fontSize:'10px'}}>SAT</div><div className="hud-value text-[11px]">{(data.satellites?.length||0)}</div></div>
+                          <div><div className="hud-label" style={{fontSize:'10px'}}>CAM</div><div className="hud-value text-[11px]">{(data.cameras?.length||0)}</div></div>
+                          <div><div className="hud-label" style={{fontSize:'10px'}}>WX</div><div className="hud-value text-[11px]" style={{color:'var(--accent-weather)'}}>{(data.weather_events?.length||0)}</div></div>
+                          <div><div className="hud-label" style={{fontSize:'10px'}}>NUC</div><div className="hud-value text-[11px]" style={{color:'var(--accent-nuclear)'}}>{(data.infrastructure?.length||0)}</div></div>
                         </div>
                       </div>
-                      <LayerPanel data={data} activeLayers={activeLayers} setActiveLayers={setActiveLayers} isMobile={true} theme={osirisTheme} setTheme={setOsirisTheme} />
+                      <LayerPanel data={data} activeLayers={activeLayers} setActiveLayers={setActiveLayers} isMobile={true} theme={osirisTheme} setTheme={setOsirisTheme} capabilities={capabilities} />
                       <div className="mt-8">
                         <ViewPresets onNavigate={(lat, lng, zoom) => { setFlyToLocation({ lat, lng, ts: Date.now() }); setMapView(v => ({ ...v, zoom })); setMobilePanel(null); }} />
                       </div>
@@ -1225,6 +1582,17 @@ export default function Dashboard() {
                       <OsintPanel isOpen={true} onClose={() => setMobilePanel(null)} isMobile={true} onSweepVisualize={setSweepData} />
                     </div>
                   )}
+                  {mobilePanel === 'remote' && (
+                    <WorldRemote onClose={() => setMobilePanel(null)} onPlaceOnMap={(devs) => {
+                      setScanTargets(prev => {
+                        const ids = new Set(prev.map((t: any) => t.id));
+                        const next = [...prev];
+                        devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: 'BLE' }); });
+                        return next.slice(0, 20);
+                      });
+                      if (devs.length > 0) setFlyToLocation({ lat: devs[0].lat, lng: devs[0].lng, ts: Date.now() });
+                    }} />
+                  )}
                 </div>
               </motion.div>
             )}
@@ -1232,20 +1600,20 @@ export default function Dashboard() {
         </>
       )}
 
-      {/* ── BOTTOM RAW METRICS (desktop) ── */}
+      {/* ── BOTTOM CURSOR INFO (desktop) ── */}
       {!isMobile && (
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 3, duration: 0.8 }} className="desktop-only absolute bottom-8 z-[200] pointer-events-auto" style={{ left: '72px' }}>
-          <div className="flex items-center gap-6 text-[8px] font-mono tracking-widest text-[var(--text-muted)] opacity-60">
-            <div className="flex gap-2 items-center">
-              <span>COORD</span>
+          <div className="flex items-center gap-5 text-[10px] font-mono tracking-widest text-[var(--text-muted)] opacity-60">
+            <div className="flex gap-2 items-center" title="Cursor coordinates (hover over map)">
+              <span>CURSOR</span>
               <span ref={coordsDisplayRef} className="text-[var(--gold-primary)] font-bold tabular-nums">—</span>
             </div>
-            <div className="flex gap-2 items-center">
-              <span>LOC</span>
+            <div className="flex gap-2 items-center" title="Reverse-geocoded location name">
+              <span>LOCATION</span>
               <span className="text-[var(--cyan-primary)] truncate max-w-[200px]">{locationLabel || 'HOVER MAP'}</span>
             </div>
-            <div className="flex gap-2 items-center">
-              <span>Z</span>
+            <div className="flex gap-2 items-center" title="Current zoom level">
+              <span>ZOOM</span>
               <span className="text-[var(--gold-primary)] font-bold tabular-nums">{mapView.zoom.toFixed(1)}</span>
             </div>
           </div>
@@ -1265,7 +1633,7 @@ export default function Dashboard() {
             {dossierLoading ? (
               <div className="text-center py-8">
                 <div className="w-5 h-5 border-2 border-[var(--gold-primary)] border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-                <span className="text-[8px] font-mono text-[var(--text-muted)] tracking-widest">COMPILING INTEL...</span>
+                <span className="text-[10px] font-mono text-[var(--text-muted)] tracking-widest">COMPILING INTEL...</span>
               </div>
             ) : regionDossier && (
               <div className="space-y-3">
@@ -1280,8 +1648,8 @@ export default function Dashboard() {
                     <div><div className="hud-label mb-0.5">AREA</div><div className="text-xs text-[var(--text-primary)]">{regionDossier.country.area?.toLocaleString()} km²</div></div>
                   </div>
                 )}
-                {regionDossier.head_of_state && (<div><div className="hud-label mb-0.5">HEAD OF STATE</div><div className="text-xs text-[var(--gold-primary)]">{regionDossier.head_of_state.name}</div><div className="text-[8px] text-[var(--text-muted)]">{regionDossier.head_of_state.position}</div></div>)}
-                {regionDossier.wikipedia && (<div><div className="hud-label mb-1">INTELLIGENCE BRIEF</div><div className="flex gap-3">{regionDossier.wikipedia.thumbnail && <img src={regionDossier.wikipedia.thumbnail} alt="" className="w-14 h-14 rounded object-cover flex-shrink-0" />}<p className="text-[8px] text-[var(--text-secondary)] leading-relaxed">{regionDossier.wikipedia.extract}</p></div></div>)}
+                {regionDossier.head_of_state && (<div><div className="hud-label mb-0.5">HEAD OF STATE</div><div className="text-xs text-[var(--gold-primary)]">{regionDossier.head_of_state.name}</div><div className="text-[10px] text-[var(--text-muted)]">{regionDossier.head_of_state.position}</div></div>)}
+                {regionDossier.wikipedia && (<div><div className="hud-label mb-1">INTELLIGENCE BRIEF</div><div className="flex gap-3">{regionDossier.wikipedia.thumbnail && <img src={regionDossier.wikipedia.thumbnail} alt="" className="w-14 h-14 rounded object-cover flex-shrink-0" />}<p className="text-[10px] text-[var(--text-secondary)] leading-relaxed">{regionDossier.wikipedia.extract}</p></div></div>)}
               </div>
             )}
           </div>
@@ -1330,9 +1698,9 @@ export default function Dashboard() {
       {/* ── GLOBAL STATUS TICKER (bottom) ── */}
       <GlobalStatusBar />
 
-      {/* Shortcut hint */}
-      <div className="desktop-only absolute bottom-[26px] right-5 z-[200] pointer-events-none text-[6px] font-mono text-[var(--text-muted)]/40 tracking-widest">
-        [?] SHORTCUTS · [F] FULLSCREEN · [S] SHARE · [R] RESET VIEW
+      {/* Shortcut hint — more visible */}
+      <div className="desktop-only absolute bottom-[26px] right-5 z-[200] pointer-events-none text-[10px] font-mono text-[var(--text-muted)] opacity-50 tracking-widest" title="Press ? to see all keyboard shortcuts">
+        Press <span className="text-[var(--gold-primary)] opacity-80">?</span> for shortcuts · <span className="text-[var(--gold-primary)] opacity-80">F</span> fullscreen · <span className="text-[var(--gold-primary)] opacity-80">R</span> reset view
       </div>
 
 

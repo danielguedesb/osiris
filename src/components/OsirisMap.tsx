@@ -18,6 +18,31 @@ interface OsirisMapProps {
   scanTargets?: any[];
   demoMode?: boolean;
   theme?: 'core' | 'ghost';
+  drawnPolygons?: Array<{ id: string; name: string; geojson: GeoJSON.Feature<GeoJSON.Polygon>; color: string }>;
+  arcgisLayers?: Array<{ id: string; title: string; geojson: any; color?: string; opacity?: number }>;
+  drawingMode?: boolean;
+  onDrawComplete?: (coords: number[][]) => void;
+  onMapCenter?: (coords: { lat: number; lng: number; bounds?: { west: number; south: number; east: number; north: number } }) => void;
+  /** Active turn-by-turn route drawn as a line with origin/destination pins. */
+  route?: {
+    geometry: { type: 'LineString'; coordinates: [number, number][] };
+    from: { lat: number; lng: number };
+    to: { lat: number; lng: number };
+    /** Unselected alternatives, drawn dimmed behind the active line. */
+    alternates?: Array<{ type: 'LineString'; coordinates: [number, number][] }>;
+    /** Highlighted portion for the step the operator has selected. */
+    activeSegment?: [number, number][] | null;
+  } | null;
+  /** Live position from the browser — drawn as a pulsing dot with accuracy ring. */
+  userLocation?: { lat: number; lng: number; accuracy?: number; heading?: number | null } | null;
+  /** Keep the camera centred on userLocation as it moves. */
+  followUser?: boolean;
+  /** Fired when the operator pans/zooms/rotates while follow mode is on. */
+  onFollowInterrupt?: () => void;
+  /** Live navigation: tighter zoom and the map turned to face travel direction. */
+  navigating?: boolean;
+  /** Corroborated endpoint airports for watched aircraft, keyed by icao24. */
+  aircraftAirports?: Record<string, Array<{ icao: string; iata?: string; city?: string; lat: number; lng: number }>>;
 }
 
 function computeSolarTerminator(): [number, number][] {
@@ -42,12 +67,15 @@ function computeSolarTerminator(): [number, number][] {
 
 const EMPTY_FC = { type: 'FeatureCollection' as const, features: [] };
 
-function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightClick, onViewStateChange, flyToLocation, projection = 'globe', mapStyle = 'dark', sweepData, scanTargets = [], demoMode = false, theme = 'core' }: OsirisMapProps) {
+function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightClick, onViewStateChange, flyToLocation, projection = 'globe', mapStyle = 'dark', sweepData, scanTargets = [], demoMode = false, theme = 'core', drawnPolygons = [], arcgisLayers = [], drawingMode = false, onDrawComplete, onMapCenter, route = null, userLocation = null, followUser = false, onFollowInterrupt, navigating = false, aircraftAirports = {} }: OsirisMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const popupRef = useRef<maplibregl.Popup | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const prevStyleRef = useRef(mapStyle);
+  const prevDrawnPolygonsRef = useRef<string[]>([]);
+  const prevArcgisLayersRef = useRef<string[]>([]);
+  const drawingCoordsRef = useRef<number[][]>([]);
 
   // Create aircraft icon on canvas (for WebGL symbol layer)
   const createIcon = useCallback((map: maplibregl.Map, id: string, color: string, size: number) => {
@@ -181,8 +209,10 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
       createDot(map, 'dot-fire', isGhost ? phantomPurple : '#E65100', 10);
       createDot(map, 'dot-cctv', cameraColor, 10);
 
-      const sources = ['flights','military','jets','private-fl','satellites','earthquakes','gdelt','gps-jamming','day-night','cctv','fires','weather','infrastructure','maritime','maritime-choke','maritime-ships','live-news','sigint-news','conflict-zones', 'war-alerts-targets', 'war-alerts-lines', 'balloons', 'radiation', 'ip-sweep-devices', 'ip-sweep-pulse', 'ip-sweep-connections', 'scan-targets', 'sdk-entities', 'sdk-links', 'malware-nodes', 'network-mesh'];
+      const sources = ['flights','military','jets','private-fl','satellites','earthquakes','gdelt','day-night','cctv','fires','weather','infrastructure','maritime','maritime-choke','maritime-ships','live-news','conflict-zones', 'war-alerts-targets', 'war-alerts-lines', 'balloons', 'radiation', 'ip-sweep-devices', 'ip-sweep-pulse', 'ip-sweep-connections', 'scan-targets', 'sdk-entities', 'sdk-links', 'malware-nodes', 'network-mesh', 'cyber-arcs', 'cyber-heads', 'cyber-impacts', 'gdelt-events', 'cf-outages', 'cf-attacks'];
       sources.forEach(s => map.addSource(s, { type: 'geojson', data: EMPTY_FC }));
+
+      // ── FLIGHT ROUTE VISUALIZATION SOURCES & LAYERS ──
 
       // Warning icon generator (parameterized — eliminates 3x copy-paste)
       const createWarningIcon = (id: string, color: string) => {
@@ -297,16 +327,86 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
         'line-opacity': 0.4,
       }});
 
+      // ══ LIVE CYBER ATTACKS — dark wire network (source → target) ══
+      map.addLayer({ id: 'cyber-arcs-atmo', type: 'line', source: 'cyber-arcs', paint: {
+        'line-color': '#000000', 'line-width': ['interpolate',['linear'],['zoom'], 1,4, 5,7, 10,12],
+        'line-opacity': 0.12, 'line-blur': 6,
+      }});
+      map.addLayer({ id: 'cyber-arcs-glow', type: 'line', source: 'cyber-arcs', paint: {
+        'line-color': '#111111', 'line-width': ['interpolate',['linear'],['zoom'], 1,2, 5,3.5, 10,6],
+        'line-opacity': 0.3, 'line-blur': 2,
+      }});
+      map.addLayer({ id: 'cyber-arcs-core', type: 'line', source: 'cyber-arcs', paint: {
+        'line-color': '#000000', 'line-width': ['interpolate',['linear'],['zoom'], 1,0.8, 5,1.4, 10,2.2],
+        'line-opacity': 0.7,
+      }});
+      // Animated dashed flow line — fast marching ants in black
+      map.addLayer({ id: 'cyber-arcs-flow', type: 'line', source: 'cyber-arcs', paint: {
+        'line-color': '#1a1a1a', 'line-width': ['interpolate',['linear'],['zoom'], 1,1.0, 5,1.8, 10,3],
+        'line-opacity': 0.55, 'line-dasharray': [2, 3],
+      }});
+      map.addLayer({ id: 'cyber-impacts', type: 'circle', source: 'cyber-impacts', paint: {
+        'circle-radius': ['interpolate',['linear'],['zoom'], 1,6, 5,12, 10,18],
+        'circle-color': '#000000', 'circle-opacity': 0.08, 'circle-blur': 0.6,
+      }});
+      map.addLayer({ id: 'cyber-heads', type: 'circle', source: 'cyber-heads', paint: {
+        'circle-radius': ['interpolate',['linear'],['zoom'], 1,2.5, 5,4, 10,6],
+        'circle-color': '#111111', 'circle-opacity': 0.95,
+        'circle-stroke-width': 1.5, 'circle-stroke-color': '#333', 'circle-stroke-opacity': 0.9,
+      }});
+      map.addLayer({ id: 'cyber-labels', type: 'symbol', source: 'cyber-heads', minzoom: 3, layout: {
+        'text-field': ['get','malware'], 'text-size': 9, 'text-font': ['JetBrains Mono Bold', 'Open Sans Bold'],
+        'text-offset': [0, 1.5], 'text-max-width': 10, 'text-allow-overlap': false,
+      }, paint: { 'text-color': '#333333', 'text-halo-color': '#000', 'text-halo-width': 1.5, 'text-opacity': 0.85 }});
 
       map.addLayer({ id: 'gdelt-dots', type: 'circle', source: 'gdelt', paint: {
         'circle-radius': 4, 'circle-color': '#D32F2F', 'circle-opacity': 0.5, 'circle-stroke-width': 1, 'circle-stroke-color': '#D32F2F', 'circle-stroke-opacity': 0.25,
       }});
 
-      // GPS Jamming — crimson
-      map.addLayer({ id: 'jam-fill', type: 'circle', source: 'gps-jamming', paint: { 'circle-radius': 30, 'circle-color': '#D32F2F', 'circle-opacity': 0.12, 'circle-blur': 1 }});
-      map.addLayer({ id: 'jam-label', type: 'symbol', source: 'gps-jamming', layout: {
-        'text-field': ['concat','GPS JAM ',['to-string',['get','severity']],'%'], 'text-size': 10, 'text-font': ['Open Sans Bold'], 'text-allow-overlap': true,
-      }, paint: { 'text-color': '#D32F2F', 'text-halo-color': '#000', 'text-halo-width': 1 }});
+      /* ── GDELT 2.0 Events — coloured by CAMEO QuadClass so cooperation and
+         conflict are separable at a glance, sized by article volume. ── */
+      map.addLayer({ id: 'gdelt-events-dots', type: 'circle', source: 'gdelt-events', paint: {
+        'circle-radius': ['interpolate',['linear'],['get','articles'], 1,3, 10,5, 50,8, 200,12],
+        'circle-color': ['match',['get','quad'],
+          1,'#00E676',   // verbal cooperation
+          2,'#00E5FF',   // material cooperation
+          3,'#FF9500',   // verbal conflict
+          4,'#FF3D3D',   // material conflict
+          '#9B978E'],
+        'circle-opacity': 0.75,
+        'circle-stroke-width': 1,
+        'circle-stroke-color': '#000000',
+        'circle-stroke-opacity': 0.6,
+      }});
+
+      /* ── Cloudflare Radar — internet outages (country-scoped) ── */
+      map.addLayer({ id: 'cf-outage-halo', type: 'circle', source: 'cf-outages', paint: {
+        'circle-radius': ['interpolate',['linear'],['zoom'], 1,14, 5,26, 10,40],
+        'circle-color': '#FFB300', 'circle-opacity': 0.12, 'circle-blur': 0.9,
+      }});
+      map.addLayer({ id: 'cf-outage-dots', type: 'circle', source: 'cf-outages', paint: {
+        'circle-radius': ['interpolate',['linear'],['zoom'], 1,4, 5,6, 10,9],
+        // Resolved outages read cooler than ongoing ones.
+        'circle-color': ['case',['get','ongoing'],'#FFB300','#8B7325'],
+        'circle-opacity': 0.9,
+        'circle-stroke-width': 1.5, 'circle-stroke-color': '#000000', 'circle-stroke-opacity': 0.7,
+      }});
+      map.addLayer({ id: 'cf-outage-label', type: 'symbol', source: 'cf-outages', minzoom: 3, layout: {
+        'text-field': ['get','country_name'], 'text-size': 9, 'text-font': ['JetBrains Mono Bold', 'Open Sans Bold'],
+        'text-offset': [0, 1.4], 'text-max-width': 12, 'text-allow-overlap': false,
+      }, paint: { 'text-color': '#FFB300', 'text-halo-color': '#000', 'text-halo-width': 1.5, 'text-opacity': 0.85 }});
+
+      /* ── Cloudflare Radar — layer-3 attack origin share ── */
+      map.addLayer({ id: 'cf-attack-dots', type: 'circle', source: 'cf-attacks', paint: {
+        'circle-radius': ['interpolate',['linear'],['get','share'], 0,4, 5,9, 20,16, 50,24],
+        'circle-color': '#FF3D3D', 'circle-opacity': 0.35, 'circle-blur': 0.3,
+        'circle-stroke-width': 1, 'circle-stroke-color': '#FF3D3D', 'circle-stroke-opacity': 0.7,
+      }});
+      map.addLayer({ id: 'cf-attack-label', type: 'symbol', source: 'cf-attacks', minzoom: 2, layout: {
+        'text-field': ['concat',['get','country'],' ',['to-string',['get','share']],'%'],
+        'text-size': 9, 'text-font': ['JetBrains Mono Bold', 'Open Sans Bold'],
+        'text-offset': [0, 1.6], 'text-allow-overlap': false,
+      }, paint: { 'text-color': '#FF6B6B', 'text-halo-color': '#000', 'text-halo-width': 1.5, 'text-opacity': 0.9 }});
 
       // Weather Events (NASA EONET) — deep violet
       map.addLayer({ id: 'weather-glow', type: 'circle', source: 'weather', paint: {
@@ -402,21 +502,6 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
         'text-offset': [0, 1.8], 'text-max-width': 12, 'text-allow-overlap': false,
       }, paint: { 'text-color': '#EC407A', 'text-halo-color': '#000', 'text-halo-width': 1, 'text-opacity': 0.8 }});
 
-      // SIGINT RSS news - gold markers
-      map.addLayer({ id: 'sigint-news-glow', type: 'circle', source: 'sigint-news', paint: {
-        'circle-radius': ['interpolate',['linear'],['zoom'], 1,6, 5,10, 10,18],
-        'circle-color': '#D4AF37', 'circle-opacity': 0.12, 'circle-blur': 1,
-      }});
-      map.addLayer({ id: 'sigint-news-dots', type: 'circle', source: 'sigint-news', paint: {
-        'circle-radius': ['interpolate',['linear'],['zoom'], 1,3, 5,5, 10,8],
-        'circle-color': '#D4AF37', 'circle-opacity': 0.9,
-        'circle-stroke-width': 1.5, 'circle-stroke-color': '#FFF8DC', 'circle-stroke-opacity': 0.6,
-      }});
-      map.addLayer({ id: 'sigint-news-label', type: 'symbol', source: 'sigint-news', minzoom: 5, layout: {
-        'text-field': ['get','source'], 'text-size': 9, 'text-font': ['Open Sans Regular'],
-        'text-offset': [0, 1.6], 'text-max-width': 10, 'text-allow-overlap': false,
-      }, paint: { 'text-color': '#D4AF37', 'text-halo-color': '#000', 'text-halo-width': 1, 'text-opacity': 0.85 }});
-
       // ══ IP SWEEP — Neighborhood device visualization ══
       map.addLayer({ id: 'sweep-connections', type: 'line', source: 'ip-sweep-connections', paint: {
         'line-color': ['get', 'color'], 'line-width': 1, 'line-opacity': 0.3, 'line-dasharray': [2, 4],
@@ -471,6 +556,8 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
           'icon-rotate': ['get','heading'], 'icon-rotation-alignment': 'map', 'icon-allow-overlap': true, 'icon-ignore-placement': true,
         }, paint: { 'icon-opacity': 0.85 }});
       });
+
+      // Route layers are added later (after setMapReady) so they render on top of everything.
 
       // Balloons (moving entities)
       map.addLayer({ id: 'balloon-dots', type: 'circle', source: 'balloons', paint: {
@@ -561,6 +648,7 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
         'text-offset': [0, 1.2], 'text-allow-overlap': false,
       }, paint: { 'text-color': ['match', ['get','type'], 'military','#D32F2F', 'tanker','#E65100', 'cargo','#26C6DA', '#B0BEC5'], 'text-halo-color': '#000', 'text-halo-width': 1 }});
 
+
       setMapReady(true);
     });
 
@@ -590,33 +678,114 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     const urlSafe = (s: any): string => { const u = String(s ?? ''); return /^https?:\/\//i.test(u) ? u : '#'; };
     const colorSafe = (s: any): string => /^#[0-9a-fA-F]{3,8}$/.test(String(s ?? '')) ? String(s) : '#aaa';
 
-    // ── Flights (with FlightAware + ADS-B Exchange links) ──
+    const formatTime = (iso: string | null) => {
+      if (!iso) return '—';
+      try {
+        const d = new Date(iso);
+        return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' });
+      } catch { return '—'; }
+    };
+
+    // ── Flights (with FlightAware + ADS-B Exchange links + ROUTE VISUALIZATION) ──
     ['fl-commercial','fl-private','fl-jets','fl-military'].forEach(layer => {
       map.on('click', layer, e => {
         if (!e.features?.length) return;
         const p = e.features[0].properties as any;
         const coords = (e.features[0].geometry as any).coordinates;
         const cs = (p.callsign||'').trim();
-        popup(coords, `<div style="${pStyle}border:1px solid rgba(212,175,55,0.3);">
+
+        // Show initial popup immediately (without route data)
+        const routeLoadingId = `route-info-${Date.now()}`;
+        popup(coords, `<div style="${pStyle}border:1px solid rgba(255,255,255,0.08);">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-            <span style="color:#D4AF37;font-size:16px;font-weight:700;letter-spacing:0.1em;">${htmlEsc(cs)}</span>
+            <span style="color:#E8E6E0;font-size:15px;font-weight:700;letter-spacing:0.08em;">${htmlEsc(cs)}</span>
             <span style="color:#5C5A54;font-size:10px;">${htmlEsc(p.icao24||'')}</span>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;">
-            <div><span style="color:#5C5A54;font-size:9px;">MODEL</span><br/><span style="color:#E8E6E0;">${htmlEsc(p.model||'—')}</span></div>
-            <div><span style="color:#5C5A54;font-size:9px;">ALT</span><br/><span style="color:#00E5FF;">${p.alt?Math.round(p.alt)+'m':'—'}</span></div>
-            <div><span style="color:#5C5A54;font-size:9px;">SPEED</span><br/><span style="color:#E8E6E0;">${p.speed_knots||'—'}kt</span></div>
-            <div><span style="color:#5C5A54;font-size:9px;">HDG</span><br/><span style="color:#E8E6E0;">${Math.round(p.heading||0)}°</span></div>
-            <div><span style="color:#5C5A54;font-size:9px;">REG</span><br/><span style="color:#E8E6E0;">${htmlEsc(p.registration||'—')}</span></div>
-            <div><span style="color:#5C5A54;font-size:9px;">POS</span><br/><span style="color:#E8E6E0;">${coords[1].toFixed(2)},${coords[0].toFixed(2)}</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">MODEL</span><br/><span style="color:#B0BEC5;">${htmlEsc(p.model||'—')}</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">ALT</span><br/><span style="color:#B0BEC5;">${p.alt?Math.round(p.alt)+'m':'—'}</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">SPEED</span><br/><span style="color:#B0BEC5;">${p.speed_knots||'—'}kt</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">HDG</span><br/><span style="color:#B0BEC5;">${Math.round(p.heading||0)}°</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">REG</span><br/><span style="color:#B0BEC5;">${htmlEsc(p.registration||'—')}</span></div>
+            <div><span style="color:#5C5A54;font-size:9px;">POS</span><br/><span style="color:#B0BEC5;">${coords[1].toFixed(2)},${coords[0].toFixed(2)}</span></div>
           </div>
-          <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;">
-            <a href="https://www.flightaware.com/live/flight/${encodeURIComponent(cs)}" target="_blank" style="${linkStyle}color:#D4AF37;border:1px solid rgba(212,175,55,0.4);background:rgba(212,175,55,0.1);">⚡ FLIGHTAWARE</a>
-            <a href="https://globe.adsbexchange.com/?icao=${encodeURIComponent(p.icao24||'')}" target="_blank" style="${linkStyle}color:#00E5FF;border:1px solid rgba(0,229,255,0.4);background:rgba(0,229,255,0.1);">📡 ADS-B</a>
-            <a href="https://www.radarbox.com/data/flights/${encodeURIComponent(cs)}" target="_blank" style="${linkStyle}color:#FF69B4;border:1px solid rgba(255,105,180,0.4);background:rgba(255,105,180,0.1);">📍 RADARBOX</a>
+          <div id="ac-${idSafe(p.icao24||'')}" style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
+            <span style="color:#5C5A54;font-size:9px;letter-spacing:0.1em;">IDENTIFYING AIRFRAME…</span>
           </div>
-          <button onclick="window.openOsirisIntel({ callsign: '${idSafe(cs)}', icao24: '${idSafe(p.icao24||'')}', model: '${idSafe(p.model||'')}', registration: '${idSafe(p.registration||'')}' })" style="width:100%;margin-top:8px;padding:6px 12px;background:rgba(212,175,55,0.15);border:1px solid rgba(212,175,55,0.5);color:#D4AF37;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:bold;letter-spacing:0.1em;border-radius:4px;cursor:pointer;">[ DEEP DIVE INTEL ]</button>
+          <button onclick="window.osirisWatchFlight && window.osirisWatchFlight({ icao24: '${idSafe(p.icao24||'')}', callsign: '${idSafe(cs)}' })" style="width:100%;margin-top:8px;padding:6px 12px;background:rgba(0,229,255,0.10);border:1px solid rgba(0,229,255,0.35);color:#7FE9FF;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:bold;letter-spacing:0.1em;border-radius:4px;cursor:pointer;">+ WATCH THIS AIRCRAFT</button>
+          <div id="${routeLoadingId}" style="margin-top:8px;padding:6px;border-top:1px solid rgba(255,255,255,0.06);text-align:center;">
+            <span style="color:#5C5A54;font-size:9px;letter-spacing:0.1em;">RESOLVING ROUTE…</span>
+          </div>
+          <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap;">
+            <a href="https://www.flightaware.com/live/flight/${encodeURIComponent(cs)}" target="_blank" style="${linkStyle}color:#78909C;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);">FLIGHTAWARE</a>
+            <a href="https://globe.adsbexchange.com/?icao=${encodeURIComponent(p.icao24||'')}" target="_blank" style="${linkStyle}color:#78909C;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);">ADS-B</a>
+            <a href="https://www.radarbox.com/data/flights/${encodeURIComponent(cs)}" target="_blank" style="${linkStyle}color:#78909C;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);">RADARBOX</a>
+          </div>
+          <button onclick="window.openOsirisIntel({ callsign: '${idSafe(cs)}', icao24: '${idSafe(p.icao24||'')}', model: '${idSafe(p.model||'')}', registration: '${idSafe(p.registration||'')}' })" style="width:100%;margin-top:6px;padding:5px 12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.12);color:#B0BEC5;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:bold;letter-spacing:0.1em;border-radius:4px;cursor:pointer;">DEEP DIVE INTEL</button>
         </div>`);
+
+        // The transponder only reports a type code (often nothing at all), so
+        // resolve the real manufacturer/model and registration out of band.
+        if (p.icao24) {
+          fetch(`/api/aircraft?icao24=${encodeURIComponent(p.icao24)}`)
+            .then(r => (r.ok ? r.json() : null))
+            .then((d) => {
+              const el = document.getElementById(`ac-${p.icao24}`);
+              if (!el || !d || d.error) {
+                if (el) el.innerHTML = '<span style="color:#5C5A54;font-size:9px;">AIRFRAME NOT IN REGISTRY</span>';
+                return;
+              }
+              const bits = [d.registration, d.typeCode, d.operator].filter(Boolean)
+                .map((x: string) => htmlEsc(String(x))).join(' · ');
+              el.innerHTML =
+                `<div style="color:#E8E6E0;font-size:11px;line-height:1.35;">${htmlEsc(d.model || 'Unidentified type')}</div>` +
+                (bits ? `<div style="color:#78909C;font-size:9px;margin-top:2px;">${bits}</div>` : '');
+            })
+            .catch(() => {});
+        }
+
+        // Resolve origin/destination for the readout only. The line this used
+        // to draw was a straight hop between two airports, which is not the
+        // path flown — watched aircraft draw their real reported track instead.
+        const cleanCallsign = cs.replace(/\s+/g, '');
+        const routeParams = new URLSearchParams({
+          callsign: cleanCallsign,
+          icao24: p.icao24 || '',
+          lat: String(coords[1]),
+          lng: String(coords[0]),
+          speed: String(p.speed_knots || 0),
+        });
+        fetch(`/api/flight-route?${routeParams}`)
+          .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+          .then(routeData => {
+            const el = document.getElementById(routeLoadingId);
+            if (!el) return;
+            if (routeData.found && routeData.origin && routeData.destination) {
+              const depTime = formatTime(routeData.departureTime);
+              const arrTime = formatTime(routeData.arrivalTime);
+              const pct = Math.round((routeData.progress || 0) * 100);
+              const distKm = routeData.totalDistanceKm || 0;
+              el.innerHTML = `
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                  <div><span style="color:#5C5A54;font-size:8px;">FROM</span><br/><span style="color:#E8E6E0;font-size:13px;font-weight:700;">${htmlEsc(routeData.origin.iata || routeData.origin.icao)}</span> <span style="color:#5C5A54;font-size:9px;">${htmlEsc(routeData.origin.city)}</span></div>
+                  <span style="color:#5C5A54;font-size:11px;">&rarr;</span>
+                  <div style="text-align:right;"><span style="color:#5C5A54;font-size:8px;">TO</span><br/><span style="color:#E8E6E0;font-size:13px;font-weight:700;">${htmlEsc(routeData.destination.iata || routeData.destination.icao)}</span> <span style="color:#5C5A54;font-size:9px;">${htmlEsc(routeData.destination.city)}</span></div>
+                </div>
+                <div style="height:2px;background:rgba(255,255,255,0.06);border-radius:1px;margin:6px 0;"><div style="width:${pct}%;height:100%;background:rgba(255,255,255,0.35);border-radius:1px;"></div></div>
+                <div style="display:flex;justify-content:space-between;font-size:10px;color:#78909C;">
+                  <span>DEP ${depTime}</span>
+                  <span>${pct}% &middot; ${distKm.toLocaleString()}km</span>
+                  <span>ARR ${arrTime}</span>
+                </div>
+              `;
+            } else {
+              el.innerHTML = `<span style="color:#5C5A54;font-size:9px;">NO SCHEDULED ROUTE</span>`;
+            }
+          })
+          .catch(() => {
+            const el = document.getElementById(routeLoadingId);
+            if (el) el.innerHTML = `<span style="color:#5C5A54;font-size:9px;">ROUTE UNAVAILABLE</span>`;
+          });
       });
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
@@ -719,29 +888,113 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     });
 
 
+    // ── GDELT 2.0 Events ──
+    const QUAD_COLOR: Record<string, string> = { '1': '#00E676', '2': '#00E5FF', '3': '#FF9500', '4': '#FF3D3D' };
+    map.on('click', 'gdelt-events-dots', e => {
+      if (!e.features?.length) return;
+      const p = e.features[0].properties as any;
+      const coords = (e.features[0].geometry as any).coordinates;
+      const accent = QUAD_COLOR[String(p.quad)] ?? '#9B978E';
+      const src = urlSafe(p.url);
+      const tone = Number(p.tone);
+      popup(coords, `
+      <div style="${pStyle}border:1px solid ${accent}66;min-width:250px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <span style="width:7px;height:7px;border-radius:50%;background:${accent};box-shadow:0 0 8px ${accent};"></span>
+          <span style="color:${accent};font-size:10px;font-weight:700;letter-spacing:0.15em;">${htmlEsc(p.quad_label)}</span>
+        </div>
+        <div style="color:#E8E6E0;font-size:12px;font-weight:700;margin-bottom:8px;">${htmlEsc(p.name)}</div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:10px;color:#9B978E;">
+          <span style="opacity:0.6;">Goldstein</span><span style="color:${Number(p.goldstein) < 0 ? '#FF3D3D' : '#00E676'};">${htmlEsc(p.goldstein)}</span>
+          <span style="opacity:0.6;">Avg tone</span><span style="color:${tone < 0 ? '#FF9500' : '#00E676'};">${htmlEsc(p.tone)}</span>
+          <span style="opacity:0.6;">Articles</span><span style="color:#E8E6E0;">${htmlEsc(p.articles)}</span>
+          <span style="opacity:0.6;">Country</span><span style="color:#E8E6E0;">${htmlEsc(p.country || '—')}</span>
+        </div>
+        <div style="margin-top:8px;font-size:9px;color:#5C5A54;">GDELT 2.0 · ${htmlEsc(String(p.date).slice(0, 16).replace('T', ' '))}Z</div>
+        ${src !== '#' ? `<a href="${src}" target="_blank" rel="noopener noreferrer" style="${linkStyle}color:${accent};border:1px solid ${accent}66;background:${accent}1a;">SOURCE ARTICLE</a>` : ''}
+      </div>`);
+    });
+
+    // ── Cloudflare Radar: internet outage ──
+    map.on('click', 'cf-outage-dots', e => {
+      if (!e.features?.length) return;
+      const p = e.features[0].properties as any;
+      const coords = (e.features[0].geometry as any).coordinates;
+      // MapLibre serialises feature properties, so booleans can arrive as strings.
+      const ongoing = p.ongoing === true || p.ongoing === 'true';
+      const accent = ongoing ? '#FFB300' : '#8B7325';
+      const src = urlSafe(p.url);
+      popup(coords, `
+      <div style="${pStyle}border:1px solid ${accent}66;min-width:250px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <span style="width:7px;height:7px;border-radius:50%;background:${accent};box-shadow:0 0 8px ${accent};"></span>
+          <span style="color:${accent};font-size:10px;font-weight:700;letter-spacing:0.15em;">
+            ${ongoing ? 'ONGOING OUTAGE' : 'RESOLVED OUTAGE'}
+          </span>
+        </div>
+        <div style="color:#E8E6E0;font-size:12px;font-weight:700;margin-bottom:8px;">${htmlEsc(p.country_name)}</div>
+        ${p.description ? `<div style="color:#9B978E;font-size:10px;line-height:1.6;margin-bottom:8px;">${htmlEsc(p.description)}</div>` : ''}
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:10px;color:#9B978E;">
+          <span style="opacity:0.6;">Cause</span><span style="color:#E8E6E0;">${htmlEsc(p.cause || 'Unspecified')}</span>
+          <span style="opacity:0.6;">Scope</span><span style="color:#E8E6E0;">${htmlEsc(p.scope || 'Nationwide')}</span>
+          <span style="opacity:0.6;">Started</span><span style="color:#E8E6E0;">${htmlEsc(String(p.start).slice(0, 16).replace('T', ' '))}</span>
+          ${p.end ? `<span style="opacity:0.6;">Ended</span><span style="color:#E8E6E0;">${htmlEsc(String(p.end).slice(0, 16).replace('T', ' '))}</span>` : ''}
+        </div>
+        <div style="margin-top:8px;font-size:9px;color:#5C5A54;">Cloudflare Radar</div>
+        ${src !== '#' ? `<a href="${src}" target="_blank" rel="noopener noreferrer" style="${linkStyle}color:${accent};border:1px solid ${accent}66;background:${accent}1a;">RADAR DETAIL</a>` : ''}
+      </div>`);
+    });
+
+    // ── Cloudflare Radar: attack origin share ──
+    map.on('click', 'cf-attack-dots', e => {
+      if (!e.features?.length) return;
+      const p = e.features[0].properties as any;
+      const coords = (e.features[0].geometry as any).coordinates;
+      popup(coords, `
+      <div style="${pStyle}border:1px solid rgba(255,61,61,0.4);min-width:230px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <span style="width:7px;height:7px;border-radius:50%;background:#FF3D3D;box-shadow:0 0 8px #FF3D3D;"></span>
+          <span style="color:#FF3D3D;font-size:10px;font-weight:700;letter-spacing:0.15em;">L3 ATTACK ORIGIN</span>
+        </div>
+        <div style="color:#E8E6E0;font-size:12px;font-weight:700;margin-bottom:8px;">${htmlEsc(p.country_name)}</div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:10px;color:#9B978E;">
+          <span style="opacity:0.6;">Share</span><span style="color:#FF6B6B;font-weight:700;">${htmlEsc(p.share)}%</span>
+          <span style="opacity:0.6;">Code</span><span style="color:#E8E6E0;">${htmlEsc(p.country)}</span>
+        </div>
+        <div style="margin-top:8px;font-size:9px;color:#5C5A54;line-height:1.5;">
+          Share of observed layer-3 attack traffic by origin · Cloudflare Radar
+        </div>
+      </div>`);
+    });
+
     // ── GDELT Conflicts (with source article) ──
     map.on('click', 'gdelt-dots', e => {
       if (!e.features?.length) return;
       const p = e.features[0].properties as any;
       const coords = (e.features[0].geometry as any).coordinates;
       
-      // Map coordinates to Liveuamap regions
-      let sourceUrl = p.url || '';
-      if (!sourceUrl || sourceUrl.includes('google.com')) {
-        const [lng, lat] = coords;
-        if (lat > 44 && lat < 53 && lng > 22 && lng < 40) sourceUrl = 'https://liveuamap.com/'; // Ukraine
-        else if (lat > 30 && lat < 33 && lng > 34 && lng < 36) sourceUrl = 'https://israelpalestine.liveuamap.com/'; // Gaza
-        else if (lat > 33 && lat < 34.5 && lng > 35 && lng < 36.5) sourceUrl = 'https://lebanon.liveuamap.com/'; // Lebanon
-        else if (lat > 32 && lat < 37 && lng > 35 && lng < 42) sourceUrl = 'https://syria.liveuamap.com/'; // Syria
-        else if (lat > 10 && lat < 22 && lng > 22 && lng < 38) sourceUrl = 'https://sudan.liveuamap.com/'; // Sudan
-        else if (lat > 12 && lat < 20 && lng > 42 && lng < 55) sourceUrl = 'https://yemen.liveuamap.com/'; // Yemen
-        else sourceUrl = 'https://liveuamap.com/'; // Global fallback
-      }
+      // These are GDACS alerts and each one carries its own report URL. This
+      // used to guess a Liveuamap regional war map from the coordinates
+      // instead, which sent every event outside the six hardcoded boxes — all
+      // of the Americas, Asia and Oceania among them — to the Ukraine map.
+      const src = urlSafe(p.url);
+      // GDACS is a natural-disaster feed. Every event here was headed
+      // "CONFLICT EVENT" — on a live sample that mislabelled 342 of 369
+      // events, nearly all of them wildfires.
+      const KIND: Record<string, [string, string]> = {
+        earthquake: ['🌐 EARTHQUAKE',   '#FF9500'],
+        wildfire:   ['🔥 WILDFIRE',     '#FF6B1A'],
+        flood:      ['🌊 FLOOD',        '#00B0FF'],
+        weather:    ['🌀 TROPICAL CYCLONE', '#00E5FF'],
+        volcano:    ['🌋 VOLCANO',      '#FF3D3D'],
+        drought:    ['☀️ DROUGHT',      '#FFD500'],
+      };
+      const [kindLabel, kindColor] = KIND[String(p.kind)] ?? ['⚠️ GLOBAL INCIDENT', '#FF3D3D'];
 
-      popup(coords, `<div style="${pStyle}border:1px solid rgba(255,61,61,0.3);">
-        <div style="color:#FF3D3D;font-size:12px;font-weight:700;margin-bottom:6px;">⚠️ CONFLICT EVENT</div>
+      popup(coords, `<div style="${pStyle}border:1px solid ${kindColor}4d;">
+        <div style="color:${kindColor};font-size:12px;font-weight:700;margin-bottom:6px;">${kindLabel}</div>
         <div style="font-size:9px;color:#E8E6E0;margin-bottom:8px;line-height:1.4;">${htmlEsc(p.name||'Unclassified incident')}</div>
-        <a href="${urlSafe(sourceUrl)}" target="_blank" style="${linkStyle}flex:1;text-align:center;color:#FF3D3D;border:1px solid rgba(255,61,61,0.4);background:rgba(255,61,61,0.15);display:inline-block;width:100%;box-sizing:border-box;margin-top:4px;">[ OPEN SOURCE ↗ ]</a>
+        ${src !== '#' ? `<a href="${src}" target="_blank" rel="noopener noreferrer" style="${linkStyle}flex:1;text-align:center;color:${kindColor};border:1px solid ${kindColor}66;background:${kindColor}26;display:inline-block;width:100%;box-sizing:border-box;margin-top:4px;">[ OPEN SOURCE ↗ ]</a>` : ''}
       </div>`);
     });
 
@@ -797,8 +1050,36 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
       });
     });
 
+    // ⚡ Live Cyber Attack Arcs (click on flying heads) ⚡
+    map.on('click', 'cyber-heads', e => {
+      if (!e.features?.length) return;
+      const p = e.features[0].properties as any;
+      const coords = (e.features[0].geometry as any).coordinates;
+      const sevColor = (p.severity || 5) >= 8 ? '#FF1744' : (p.severity || 5) >= 6 ? '#FF6D00' : '#FFD600';
+      const sevLabel = (p.severity || 5) >= 8 ? 'CRITICAL' : (p.severity || 5) >= 6 ? 'HIGH' : 'MEDIUM';
+      popup(coords, `<div style="${pStyle}border:1px solid ${sevColor}40;box-shadow:inset 0 0 20px ${sevColor}10, 0 0 15px ${sevColor}15;">
+        <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid ${sevColor}30;padding-bottom:6px;margin-bottom:8px;">
+          <div style="color:${sevColor};font-size:12px;font-weight:700;letter-spacing:0.12em;text-shadow:0 0 6px ${sevColor}60;">⚡ ${htmlEsc((p.action || 'ATTACK').toUpperCase())}</div>
+          <div style="font-size:8px;padding:2px 6px;border-radius:3px;font-weight:700;letter-spacing:0.1em;background:${sevColor}20;color:${sevColor};border:1px solid ${sevColor}50;">${sevLabel}</div>
+        </div>
+        <div style="color:#E8E6E0;font-size:11px;font-weight:bold;margin-bottom:10px;">${htmlEsc(p.malware || 'Unknown Payload')}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:8px;background:rgba(0,0,0,0.35);padding:8px;border-radius:4px;border:1px solid rgba(255,255,255,0.04);">
+          <div><span style="color:#5C5A54;font-size:7px;letter-spacing:0.1em;">SOURCE ORIGIN</span><br/><span style="color:#FF5252;font-family:monospace;">${p.src_lat || '?'}°, ${p.src_lng || '?'}°</span></div>
+          <div><span style="color:#5C5A54;font-size:7px;letter-spacing:0.1em;">TARGET</span><br/><span style="color:#00E5FF;font-family:monospace;">${htmlEsc(p.target_ip || '—')}</span></div>
+          <div><span style="color:#5C5A54;font-size:7px;letter-spacing:0.1em;">TARGET COUNTRY</span><br/><span style="color:#E8E6E0;">${htmlEsc(p.target_country || '—')}</span></div>
+          <div><span style="color:#5C5A54;font-size:7px;letter-spacing:0.1em;">PORT</span><br/><span style="color:#FFD600;font-family:monospace;">${p.port || '—'}</span></div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <div style="flex:1;height:3px;border-radius:2px;background:linear-gradient(90deg, ${sevColor}00, ${sevColor});opacity:0.5;"></div>
+          <span style="font-size:7px;color:#5C5A54;letter-spacing:0.15em;">SEVERITY ${p.severity || '?'}/10</span>
+          <div style="flex:1;height:3px;border-radius:2px;background:linear-gradient(90deg, ${sevColor}, ${sevColor}00);opacity:0.5;"></div>
+        </div>
+        <div style="margin-top:8px;font-size:7px;color:#5C5A54;text-align:center;letter-spacing:0.1em;">SOURCE: ABUSE.CH FEODO TRACKER</div>
+      </div>`);
+    });
+
     // ── Generic hover for clickables ──
-    ['conflict-icons','cctv-dots','eq-circles','sat-dots','fires-heat','gdelt-dots','weather-dots','infra-dots','maritime-dots','choke-dots','news-dots','sigint-news-dots','balloon-dots','rad-dots','ship-dots','sweep-device-dots','scan-targets-dots','sdk-sea','sdk-sea-glow','sdk-sea-atmo','sdk-air','sdk-air-glow','sdk-air-atmo','sdk-intel','sdk-intel-glow','sdk-intel-atmo','malware-dots'].forEach(layer => {
+    ['conflict-icons','cctv-dots','eq-circles','sat-dots','fires-heat','gdelt-dots','weather-dots','infra-dots','maritime-dots','choke-dots','news-dots','balloon-dots','rad-dots','ship-dots','sweep-device-dots','scan-targets-dots','sdk-sea','sdk-sea-glow','sdk-sea-atmo','sdk-air','sdk-air-glow','sdk-air-atmo','sdk-intel','sdk-intel-glow','sdk-intel-atmo','malware-dots','cyber-heads','gdelt-events-dots','cf-outage-dots','cf-attack-dots'].forEach(layer => {
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
     });
@@ -1117,7 +1398,7 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
 
   useEffect(() => {
     if (!mapReady) return;
-    setGeo('earthquakes', activeLayers.earthquakes && data.earthquakes ? data.earthquakes.map((eq: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [eq.lng, eq.lat] }, properties: { magnitude: eq.magnitude, place: eq.place } })) : []);
+    setGeo('earthquakes', activeLayers.earthquakes && data.earthquakes ? data.earthquakes.map((eq: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [eq.lng, eq.lat] }, properties: { id: eq.id, magnitude: eq.magnitude, place: eq.place, depth: eq.depth, source: eq.source } })) : []);
   }, [mapReady, data.earthquakes, activeLayers.earthquakes, setGeo]);
 
   useEffect(() => {
@@ -1150,8 +1431,51 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
 
   useEffect(() => {
     if (!mapReady) return;
-    setGeo('gdelt', activeLayers.global_incidents && data.gdelt ? data.gdelt.map((e: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [e.lng, e.lat] }, properties: { name: e.name } })) : []);
+    // url has to travel with the feature: /api/gdelt gives every event its own
+    // GDACS report link, and dropping it here is what left the popup with
+    // nothing to link to.
+    setGeo('gdelt', activeLayers.global_incidents && data.gdelt ? data.gdelt.map((e: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [e.lng, e.lat] }, properties: { name: e.name, url: e.url, kind: e.type } })) : []);
   }, [mapReady, data.gdelt, activeLayers.global_incidents, setGeo]);
+
+  /* ── GDELT 2.0 Events ── */
+  useEffect(() => {
+    if (!mapReady) return;
+    const al = activeLayers as any;
+    setGeo('gdelt-events', al.gdelt_events && data.gdelt_events ? data.gdelt_events.map((e: any) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [e.lng, e.lat] },
+      properties: {
+        name: e.name, country: e.country, quad: e.quad, quad_label: e.quad_label,
+        tone: e.tone, goldstein: e.goldstein, articles: e.articles, url: e.url, date: e.date,
+      },
+    })) : []);
+  }, [mapReady, data.gdelt_events, (activeLayers as any).gdelt_events, setGeo]);
+
+  /* ── Cloudflare Radar: outages ── */
+  useEffect(() => {
+    if (!mapReady) return;
+    const al = activeLayers as any;
+    setGeo('cf-outages', al.cf_outages && data.cf_outages ? data.cf_outages.map((o: any) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [o.lng, o.lat] },
+      properties: {
+        country: o.country, country_name: o.country_name, scope: o.scope, cause: o.cause,
+        event_type: o.event_type, description: o.description, start: o.start, end: o.end,
+        ongoing: !!o.ongoing, url: o.url,
+      },
+    })) : []);
+  }, [mapReady, data.cf_outages, (activeLayers as any).cf_outages, setGeo]);
+
+  /* ── Cloudflare Radar: attack origins ── */
+  useEffect(() => {
+    if (!mapReady) return;
+    const al = activeLayers as any;
+    setGeo('cf-attacks', al.cf_attacks && data.cf_attack_origins ? data.cf_attack_origins.map((a: any) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [a.lng, a.lat] },
+      properties: { country: a.country, country_name: a.country_name, share: a.share },
+    })) : []);
+  }, [mapReady, data.cf_attack_origins, (activeLayers as any).cf_attacks, setGeo]);
 
   // Malware Threats
   useEffect(() => {
@@ -1182,11 +1506,90 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     setGeo('network-mesh', meshLinks);
   }, [mapReady, activeLayers.malware, data.malware_threats, setGeo]);
 
+  // ══ LIVE CYBER ATTACKS — Threat network with real-time flow animation ══
+  const cyberAnimRef = useRef<number>(0);
 
   useEffect(() => {
-    if (!mapReady) return;
-    setGeo('gps-jamming', activeLayers.gps_jamming && data.gps_jamming ? data.gps_jamming.map((z: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [z.lng, z.lat] }, properties: { severity: z.severity } })) : []);
-  }, [mapReady, data.gps_jamming, activeLayers.gps_jamming, setGeo]);
+    if (!mapReady || !mapRef.current) return;
+    const al = activeLayers as any;
+    const attacks = data.cyber_attacks;
+
+    // Clean up when toggled off or no data
+    if (!al.cyber_attacks || !attacks?.length) {
+      cancelAnimationFrame(cyberAnimRef.current);
+      setGeo('cyber-arcs', []);
+      setGeo('cyber-heads', []);
+      setGeo('cyber-impacts', []);
+      return;
+    }
+
+    // Build static GeoJSON features (dots stay clickable)
+    const dots: any[] = [];
+    const srcGlows: any[] = [];
+    const lines: any[] = [];
+
+    for (const a of attacks) {
+      dots.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [a.dst_lng, a.dst_lat] },
+        properties: {
+          malware: a.malware, action: a.action, target_ip: a.target_ip,
+          target_country: a.target_country, port: a.port, severity: a.severity,
+          status: a.status,
+          src_lat: a.src_lat.toFixed(2), src_lng: a.src_lng.toFixed(2),
+          dst_lat: a.dst_lat.toFixed(2), dst_lng: a.dst_lng.toFixed(2),
+        },
+      });
+      srcGlows.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [a.src_lng, a.src_lat] },
+        properties: { severity: a.severity },
+      });
+      lines.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [[a.src_lng, a.src_lat], [a.dst_lng, a.dst_lat]] },
+        properties: { malware: a.malware, severity: a.severity },
+      });
+    }
+
+    setGeo('cyber-heads', dots);
+    setGeo('cyber-impacts', srcGlows);
+    setGeo('cyber-arcs', lines);
+
+    // Animate: aggressive marching-ants with fast dash cycling
+    const map = mapRef.current;
+    let step = 0;
+    function animateFlow() {
+      step++;
+      if (!map) return;
+      try {
+        // Fast cycling dash pattern — creates visible movement along the line
+        const phase = (step * 0.15) % 6;
+        map.setPaintProperty('cyber-arcs-flow', 'line-dasharray', [2, 3 + phase * 0.4]);
+
+        // Alternate opacity on the core line for flicker effect
+        const coreFlicker = 0.55 + Math.sin(step * 0.05) * 0.15;
+        map.setPaintProperty('cyber-arcs-core', 'line-opacity', coreFlicker);
+
+        // Pulse target dots — breathing black nodes
+        const pulse = 1.5 + Math.sin(step * 0.1) * 0.6;
+        map.setPaintProperty('cyber-heads', 'circle-stroke-width', pulse);
+        map.setPaintProperty('cyber-heads', 'circle-stroke-color',
+          step % 30 < 15 ? '#222222' : '#444444'
+        );
+
+        // Pulse source glow — dark breathing aura
+        const glowPulse = 0.06 + Math.sin(step * 0.07) * 0.04;
+        map.setPaintProperty('cyber-impacts', 'circle-opacity', glowPulse);
+      } catch {}
+      cyberAnimRef.current = requestAnimationFrame(animateFlow);
+    }
+    cyberAnimRef.current = requestAnimationFrame(animateFlow);
+
+    return () => cancelAnimationFrame(cyberAnimRef.current);
+  }, [mapReady, (activeLayers as any).cyber_attacks, data.cyber_attacks, setGeo]);
+
+
 
   useEffect(() => {
     if (!mapReady) return;
@@ -1272,17 +1675,6 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     setGeo('live-news', activeLayers.live_news && data.live_feeds ? data.live_feeds.map((f: any) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [f.lng, f.lat] }, properties: { name: f.name, city: f.city, country: f.country, url: f.url, category: f.category, embed_allowed: f.embed_allowed !== false } })) : []);
   }, [mapReady, data.live_feeds, activeLayers.live_news, setGeo]);
 
-  useEffect(() => {
-    if (!mapReady) return;
-    const items = data.news || [];
-    setGeo('sigint-news', activeLayers.news_intel && items.length > 0
-      ? items.filter((n: any) => n.coords?.length === 2).map((n: any) => ({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [n.coords[1], n.coords[0]] },
-          properties: { title: n.title, source: n.source, risk_score: n.risk_score, link: n.link }
-        }))
-      : []);
-  }, [mapReady, data.news, activeLayers.news_intel, setGeo]);
 
   useEffect(() => {
     if (!mapReady) return;
@@ -1353,10 +1745,13 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     const anySat = activeLayers.satellites || (activeLayers as any).sat_comms || (activeLayers as any).sat_military || (activeLayers as any).sat_navigation || (activeLayers as any).sat_earth || (activeLayers as any).sat_science;
     setVis(['sat-glow','sat-dots'], anySat);
     setVis(['gdelt-dots'], activeLayers.global_incidents);
+    setVis(['gdelt-events-dots'], (activeLayers as any).gdelt_events);
+    setVis(['cf-outage-halo','cf-outage-dots','cf-outage-label'], (activeLayers as any).cf_outages);
+    setVis(['cf-attack-dots','cf-attack-label'], (activeLayers as any).cf_attacks);
 
     setVis(['malware-glow','malware-dots','malware-label'], activeLayers.malware);
     setVis(['network-mesh-atmo', 'network-mesh-glow', 'network-mesh-core'], activeLayers.internet_outages || activeLayers.malware);
-    setVis(['jam-fill','jam-label'], activeLayers.gps_jamming);
+    setVis(['cyber-arcs-atmo','cyber-arcs-glow','cyber-arcs-core','cyber-arcs-flow','cyber-heads','cyber-impacts','cyber-labels'], (activeLayers as any).cyber_attacks);
     setVis(['day-night-fill'], activeLayers.day_night);
     setVis(['fl-commercial'], activeLayers.flights);
     setVis(['fl-private'], activeLayers.private);
@@ -1370,7 +1765,6 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
     setVis(['choke-glow','choke-dots','choke-label'], activeLayers.maritime);
     setVis(['ship-dots','ship-label'], activeLayers.maritime);
     setVis(['news-glow','news-dots','news-label'], activeLayers.live_news);
-    setVis(['sigint-news-glow','sigint-news-dots','sigint-news-label'], activeLayers.news_intel);
     setVis(['conflict-icons'], activeLayers.conflict_zones !== false);
 
     setVis(['balloon-dots','balloon-label'], activeLayers.balloons);
@@ -1596,6 +1990,533 @@ function OsirisMap({ data, activeLayers, onEntityClick, onMouseCoords, onRightCl
       console.warn('Style switch failed:', e);
     }
   }, [mapReady, mapStyle]);
+
+  // ── DRAWN POLYGONS ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+    const currentPolygons = drawnPolygons || [];
+    const currentIds = currentPolygons.map(p => p.id);
+    
+    prevDrawnPolygonsRef.current.forEach(id => {
+      if (!currentIds.includes(id)) {
+        if (map.getLayer(`drawn-polygon-label-${id}`)) map.removeLayer(`drawn-polygon-label-${id}`);
+        if (map.getLayer(`drawn-polygon-line-${id}`)) map.removeLayer(`drawn-polygon-line-${id}`);
+        if (map.getLayer(`drawn-polygon-fill-${id}`)) map.removeLayer(`drawn-polygon-fill-${id}`);
+        if (map.getSource(`drawn-polygon-${id}-label`)) map.removeSource(`drawn-polygon-${id}-label`);
+        if (map.getSource(`drawn-polygon-${id}`)) map.removeSource(`drawn-polygon-${id}`);
+      }
+    });
+    prevDrawnPolygonsRef.current = currentIds;
+
+    currentPolygons.forEach(poly => {
+      const sourceId = `drawn-polygon-${poly.id}`;
+      const fillLayerId = `drawn-polygon-fill-${poly.id}`;
+      const lineLayerId = `drawn-polygon-line-${poly.id}`;
+      const labelLayerId = `drawn-polygon-label-${poly.id}`;
+
+      // Build a centroid point feature for the label
+      const ring = poly.geojson.geometry?.coordinates?.[0] || [];
+      const centroid = ring.length > 0 ? [
+        ring.reduce((s: number, c: number[]) => s + c[0], 0) / ring.length,
+        ring.reduce((s: number, c: number[]) => s + c[1], 0) / ring.length,
+      ] : [0, 0];
+      const labelFC = { type: 'FeatureCollection' as const, features: [{ type: 'Feature' as const, properties: { name: poly.name }, geometry: { type: 'Point' as const, coordinates: centroid } }] };
+
+      if (!map.getSource(sourceId)) {
+        map.addSource(sourceId, { type: 'geojson', data: poly.geojson });
+      } else {
+        (map.getSource(sourceId) as maplibregl.GeoJSONSource).setData(poly.geojson);
+      }
+      if (!map.getSource(`${sourceId}-label`)) {
+        map.addSource(`${sourceId}-label`, { type: 'geojson', data: labelFC as any });
+      } else {
+        (map.getSource(`${sourceId}-label`) as maplibregl.GeoJSONSource).setData(labelFC as any);
+      }
+
+      if (!map.getLayer(fillLayerId)) {
+        map.addLayer({ id: fillLayerId, type: 'fill', source: sourceId, paint: { 'fill-color': poly.color, 'fill-opacity': 0.12 } });
+      }
+      if (!map.getLayer(lineLayerId)) {
+        map.addLayer({ id: lineLayerId, type: 'line', source: sourceId, paint: { 'line-color': poly.color, 'line-width': 2.5, 'line-dasharray': [6, 3] } });
+      }
+      if (!map.getLayer(labelLayerId)) {
+        map.addLayer({ id: labelLayerId, type: 'symbol', source: `${sourceId}-label`, layout: { 'text-field': ['get', 'name'], 'text-size': 11, 'text-allow-overlap': true, 'text-ignore-placement': true }, paint: { 'text-color': poly.color, 'text-halo-color': '#000000', 'text-halo-width': 2 } });
+      }
+    });
+  }, [mapReady, drawnPolygons]);
+
+  // ── DIRECTIONS ROUTE ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+
+    const SRC = 'directions-route';
+    const SRC_ALT = 'directions-alternates';
+    const SRC_ACTIVE = 'directions-active-step';
+    const SRC_ENDS = 'directions-endpoints';
+    const IDS = [
+      'directions-alt-line', 'directions-line-casing', 'directions-line',
+      'directions-active-line', 'directions-endpoint-halo', 'directions-endpoint',
+    ];
+
+    const teardown = () => {
+      IDS.forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+      [SRC, SRC_ALT, SRC_ACTIVE, SRC_ENDS].forEach(id => { if (map.getSource(id)) map.removeSource(id); });
+    };
+
+    if (!route?.geometry?.coordinates?.length) { teardown(); return; }
+
+    const fc = (features: GeoJSON.Feature[]) => ({ type: 'FeatureCollection' as const, features });
+    const line = (coords: [number, number][]): GeoJSON.Feature => ({
+      type: 'Feature', properties: {},
+      geometry: { type: 'LineString', coordinates: coords },
+    });
+    const setData = (id: string, data: unknown) => {
+      if (!map.getSource(id)) map.addSource(id, { type: 'geojson', data: data as never });
+      else (map.getSource(id) as maplibregl.GeoJSONSource).setData(data as never);
+    };
+
+    setData(SRC, fc([line(route.geometry.coordinates)]));
+    setData(SRC_ALT, fc((route.alternates || []).map(a => line(a.coordinates))));
+    setData(SRC_ACTIVE, fc(route.activeSegment?.length ? [line(route.activeSegment)] : []));
+    setData(SRC_ENDS, fc([
+      { type: 'Feature', properties: { kind: 'origin' }, geometry: { type: 'Point', coordinates: [route.from.lng, route.from.lat] } },
+      { type: 'Feature', properties: { kind: 'destination' }, geometry: { type: 'Point', coordinates: [route.to.lng, route.to.lat] } },
+    ]));
+
+    // Alternatives sit underneath, muted, so the chosen line stays unambiguous.
+    if (!map.getLayer('directions-alt-line')) {
+      map.addLayer({
+        id: 'directions-alt-line', type: 'line', source: SRC_ALT,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#5C6470',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 2.5, 14, 5],
+          'line-opacity': 0.55,
+        },
+      });
+    }
+    if (!map.getLayer('directions-line-casing')) {
+      map.addLayer({
+        id: 'directions-line-casing', type: 'line', source: SRC,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#001014', 'line-width': ['interpolate', ['linear'], ['zoom'], 5, 5, 14, 11], 'line-opacity': 0.9 },
+      });
+    }
+    if (!map.getLayer('directions-line')) {
+      map.addLayer({
+        id: 'directions-line', type: 'line', source: SRC,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#00E5FF',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 2.5, 14, 6],
+          'line-opacity': 0.95,
+        },
+      });
+    }
+    if (!map.getLayer('directions-active-line')) {
+      map.addLayer({
+        id: 'directions-active-line', type: 'line', source: SRC_ACTIVE,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#D4AF37',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 4, 14, 9],
+          'line-opacity': 0.95,
+        },
+      });
+    }
+    if (!map.getLayer('directions-endpoint-halo')) {
+      map.addLayer({
+        id: 'directions-endpoint-halo', type: 'circle', source: SRC_ENDS,
+        paint: {
+          'circle-radius': 9,
+          'circle-color': ['match', ['get', 'kind'], 'origin', '#00FF88', '#FF3B30'],
+          'circle-opacity': 0.18,
+        },
+      });
+    }
+    if (!map.getLayer('directions-endpoint')) {
+      map.addLayer({
+        id: 'directions-endpoint', type: 'circle', source: SRC_ENDS,
+        paint: {
+          'circle-radius': 5,
+          'circle-color': ['match', ['get', 'kind'], 'origin', '#00FF88', '#FF3B30'],
+          'circle-stroke-width': 1.5,
+          'circle-stroke-color': '#001014',
+        },
+      });
+    }
+  }, [mapReady, route]);
+
+  // ── ROUTE FRAMING ──
+  // Kept apart from drawing so picking a step or an alternative redraws without
+  // yanking the camera back out to the whole route.
+  const routeFrameKey = route
+    ? `${route.from.lat},${route.from.lng},${route.to.lat},${route.to.lng},${route.geometry.coordinates.length}`
+    : null;
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || !route?.geometry?.coordinates?.length) return;
+    const coords = route.geometry.coordinates;
+    let [west, south, east, north] = [coords[0][0], coords[0][1], coords[0][0], coords[0][1]];
+    for (const [lng, lat] of coords) {
+      if (lng < west) west = lng;
+      if (lng > east) east = lng;
+      if (lat < south) south = lat;
+      if (lat > north) north = lat;
+    }
+    mapRef.current.fitBounds([[west, south], [east, north]], { padding: 90, duration: 900, maxZoom: 15 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mapReady, routeFrameKey]);
+
+  // ── LIVE USER LOCATION ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+
+    const SRC = 'user-location';
+    const SRC_ACC = 'user-location-accuracy';
+    const IDS = ['user-accuracy-fill', 'user-accuracy-line', 'user-dot-pulse', 'user-dot', 'user-dot-core'];
+
+    if (!userLocation) {
+      IDS.forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+      [SRC, SRC_ACC].forEach(id => { if (map.getSource(id)) map.removeSource(id); });
+      return;
+    }
+
+    const { lat, lng, accuracy } = userLocation;
+
+    // Accuracy is a real-world radius, so it must be a polygon in degrees
+    // rather than a fixed pixel circle — it has to shrink as you zoom out.
+    const ring: [number, number][] = [];
+    const r = Math.min(Math.max(accuracy ?? 0, 0), 5000);
+    if (r > 0) {
+      const dLat = r / 111320;
+      const dLng = r / (111320 * Math.cos((lat * Math.PI) / 180) || 1);
+      for (let i = 0; i <= 64; i++) {
+        const t = (i / 64) * 2 * Math.PI;
+        ring.push([lng + dLng * Math.cos(t), lat + dLat * Math.sin(t)]);
+      }
+    }
+
+    const point = {
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [lng, lat] } }],
+    };
+    const accFc = {
+      type: 'FeatureCollection',
+      features: ring.length
+        ? [{ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } }]
+        : [],
+    };
+
+    if (!map.getSource(SRC)) map.addSource(SRC, { type: 'geojson', data: point as never });
+    else (map.getSource(SRC) as maplibregl.GeoJSONSource).setData(point as never);
+    if (!map.getSource(SRC_ACC)) map.addSource(SRC_ACC, { type: 'geojson', data: accFc as never });
+    else (map.getSource(SRC_ACC) as maplibregl.GeoJSONSource).setData(accFc as never);
+
+    if (!map.getLayer('user-accuracy-fill')) {
+      map.addLayer({ id: 'user-accuracy-fill', type: 'fill', source: SRC_ACC, paint: { 'fill-color': '#4285F4', 'fill-opacity': 0.12 } });
+    }
+    if (!map.getLayer('user-accuracy-line')) {
+      map.addLayer({ id: 'user-accuracy-line', type: 'line', source: SRC_ACC, paint: { 'line-color': '#4285F4', 'line-width': 1, 'line-opacity': 0.35 } });
+    }
+    if (!map.getLayer('user-dot-pulse')) {
+      map.addLayer({ id: 'user-dot-pulse', type: 'circle', source: SRC, paint: { 'circle-radius': 8, 'circle-color': '#4285F4', 'circle-opacity': 0.35 } });
+    }
+    if (!map.getLayer('user-dot')) {
+      map.addLayer({ id: 'user-dot', type: 'circle', source: SRC, paint: { 'circle-radius': 7, 'circle-color': '#FFFFFF' } });
+    }
+    if (!map.getLayer('user-dot-core')) {
+      map.addLayer({ id: 'user-dot-core', type: 'circle', source: SRC, paint: { 'circle-radius': 5, 'circle-color': '#4285F4' } });
+    }
+  }, [mapReady, userLocation]);
+
+  // Pulse the halo. rAF-driven, so it stops when the tab is backgrounded.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || !userLocation) return;
+    const map = mapRef.current;
+    let raf = 0;
+    const started = performance.now();
+    const tick = (now: number) => {
+      if (map.getLayer('user-dot-pulse')) {
+        const t = ((now - started) % 2000) / 2000;
+        map.setPaintProperty('user-dot-pulse', 'circle-radius', 8 + t * 22);
+        map.setPaintProperty('user-dot-pulse', 'circle-opacity', 0.35 * (1 - t));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [mapReady, userLocation]);
+
+  // ── FOLLOW MODE ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || !followUser) return;
+    const map = mapRef.current;
+    // originalEvent is only set when a real input device drove the change, so
+    // the easeTo below cannot trip this and cancel its own follow.
+    const onGesture = (e: any) => { if (e?.originalEvent) onFollowInterrupt?.(); };
+    map.on('dragstart', onGesture);
+    map.on('zoomstart', onGesture);
+    map.on('rotatestart', onGesture);
+    map.on('pitchstart', onGesture);
+    return () => {
+      map.off('dragstart', onGesture);
+      map.off('zoomstart', onGesture);
+      map.off('rotatestart', onGesture);
+      map.off('pitchstart', onGesture);
+    };
+  }, [mapReady, followUser, onFollowInterrupt]);
+
+  // Recentering runs on every position fix, so without the handover above the
+  // map fights the operator: zoom out to look ahead and the next GPS tick drags
+  // the camera back to 16.5. Follow itself is unchanged and resumes on recenter.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || !followUser || !userLocation) return;
+    // While navigating, sit close in and rotate the map so travel direction is
+    // "up" — reading a turn off a north-locked map at speed does not work.
+    mapRef.current.easeTo({
+      center: [userLocation.lng, userLocation.lat],
+      ...(navigating
+        ? {
+            zoom: Math.max(mapRef.current.getZoom(), 16.5),
+            pitch: 50,
+            ...(typeof userLocation.heading === 'number' && !Number.isNaN(userLocation.heading)
+              ? { bearing: userLocation.heading }
+              : {}),
+          }
+        : {}),
+      duration: 700,
+    });
+  }, [mapReady, followUser, userLocation, navigating]);
+
+  // Restore a plain north-up view when guidance ends.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || navigating) return;
+    mapRef.current.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+  }, [mapReady, navigating]);
+
+  // ── AIRPORTS FOR WATCHED AIRCRAFT ──
+  // The endpoints that survived corroboration against the aircraft's reported
+  // track — where the leg began and where it is booked to end.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+    const SRC = 'watched-airports';
+    const IDS = ['watched-airport-glow', 'watched-airport-dot', 'watched-airport-label'];
+
+    // The same airport can serve several watched aircraft — draw it once.
+    const seen = new Set<string>();
+    const features = Object.values(aircraftAirports).flat()
+      .filter((a) => {
+        if (!a || seen.has(a.icao)) return false;
+        seen.add(a.icao);
+        return true;
+      })
+      .map((a) => ({
+        type: 'Feature' as const,
+        properties: { label: a.iata || a.icao, city: a.city || '' },
+        geometry: { type: 'Point' as const, coordinates: [a.lng, a.lat] },
+      }));
+
+    if (features.length === 0) {
+      IDS.forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
+      if (map.getSource(SRC)) map.removeSource(SRC);
+      return;
+    }
+
+    const fc = { type: 'FeatureCollection' as const, features };
+    if (!map.getSource(SRC)) map.addSource(SRC, { type: 'geojson', data: fc as never });
+    else (map.getSource(SRC) as maplibregl.GeoJSONSource).setData(fc as never);
+
+    if (!map.getLayer('watched-airport-glow')) {
+      map.addLayer({
+        id: 'watched-airport-glow', type: 'circle', source: SRC,
+        paint: { 'circle-radius': 13, 'circle-color': '#FFB300', 'circle-opacity': 0.16, 'circle-blur': 0.8 },
+      });
+    }
+    if (!map.getLayer('watched-airport-dot')) {
+      map.addLayer({
+        id: 'watched-airport-dot', type: 'circle', source: SRC,
+        paint: {
+          'circle-radius': 5,
+          'circle-color': '#FFFFFF',
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#FFB300',
+        },
+      });
+    }
+    if (!map.getLayer('watched-airport-label')) {
+      map.addLayer({
+        id: 'watched-airport-label', type: 'symbol', source: SRC,
+        layout: {
+          'text-field': ['get', 'label'],
+          'text-size': 11,
+          'text-font': ['Open Sans Bold'],
+          'text-offset': [0, 1.6],
+          'text-allow-overlap': true,
+        },
+        paint: { 'text-color': '#FFB300', 'text-halo-color': '#0C0E1A', 'text-halo-width': 1.5 },
+      });
+    }
+  }, [mapReady, aircraftAirports]);
+
+  // ── ARCGIS LAYERS ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+    const currentLayers = arcgisLayers || [];
+    const currentIds = currentLayers.map(l => l.id);
+
+    prevArcgisLayersRef.current.forEach(id => {
+      if (!currentIds.includes(id)) {
+        const sourceId = `arcgis-${id}`;
+        if (map.getLayer(`${sourceId}-fill`)) map.removeLayer(`${sourceId}-fill`);
+        if (map.getLayer(`${sourceId}-line`)) map.removeLayer(`${sourceId}-line`);
+        if (map.getLayer(`${sourceId}-circle`)) map.removeLayer(`${sourceId}-circle`);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+      }
+    });
+    prevArcgisLayersRef.current = currentIds;
+
+    currentLayers.forEach(layer => {
+      const sourceId = `arcgis-${layer.id}`;
+      const c = layer.color || '#D4AF37';
+      const o = layer.opacity ?? 0.8;
+      if (!map.getSource(sourceId)) {
+        map.addSource(sourceId, { type: 'geojson', data: layer.geojson });
+        // A fill layer with no geometry filter is applied to LineStrings too,
+        // and maplibre fills an open path by closing it — which is what draws
+        // the triangular wedges across a pipeline or railway dataset. Fill is
+        // only ever meaningful for polygons.
+        map.addLayer({ id: `${sourceId}-fill`, type: 'fill', source: sourceId, filter: ['==', ['geometry-type'], 'Polygon'], paint: { 'fill-color': c, 'fill-opacity': o * 0.15, 'fill-outline-color': c } });
+        map.addLayer({ id: `${sourceId}-line`, type: 'line', source: sourceId, filter: ['match', ['geometry-type'], ['LineString', 'Polygon'], true, false], paint: { 'line-color': c, 'line-width': ['interpolate', ['linear'], ['zoom'], 4, 0.6, 10, 1.4, 14, 2, 18, 3], 'line-opacity': o } });
+        // A fixed radius does not survive a dense dataset: ~1.2k points at
+        // city zoom merge into one blob. Scaling with zoom keeps them as
+        // discrete stations when you are far out, and readable up close.
+        map.addLayer({ id: `${sourceId}-circle`, type: 'circle', source: sourceId, filter: ['==', ['geometry-type'], 'Point'], paint: { 'circle-color': c, 'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 1.5, 8, 2.5, 11, 4, 14, 6, 18, 9], 'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 8, 0.4, 14, 1.2], 'circle-stroke-color': '#000', 'circle-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0.55, 12, 0.85] } });
+      } else {
+        (map.getSource(sourceId) as maplibregl.GeoJSONSource).setData(layer.geojson);
+        // Update paint properties for color/opacity changes
+        if (map.getLayer(`${sourceId}-fill`)) {
+          map.setPaintProperty(`${sourceId}-fill`, 'fill-color', c);
+          map.setPaintProperty(`${sourceId}-fill`, 'fill-opacity', o * 0.15);
+          map.setPaintProperty(`${sourceId}-fill`, 'fill-outline-color', c);
+        }
+        if (map.getLayer(`${sourceId}-line`)) {
+          map.setPaintProperty(`${sourceId}-line`, 'line-color', c);
+          map.setPaintProperty(`${sourceId}-line`, 'line-opacity', o);
+        }
+        if (map.getLayer(`${sourceId}-circle`)) {
+          map.setPaintProperty(`${sourceId}-circle`, 'circle-color', c);
+          map.setPaintProperty(`${sourceId}-circle`, 'circle-opacity', o);
+        }
+      }
+    });
+  }, [mapReady, arcgisLayers]);
+
+  // ── DRAWING MODE ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+    
+    if (!drawingMode) {
+      map.doubleClickZoom.enable();
+      if (map.getLayer('draw-line-temp')) map.removeLayer('draw-line-temp');
+      if (map.getLayer('draw-points-temp')) map.removeLayer('draw-points-temp');
+      if (map.getSource('draw-temp-source')) map.removeSource('draw-temp-source');
+      drawingCoordsRef.current = [];
+      map.getCanvas().style.cursor = '';
+      return;
+    }
+
+    map.doubleClickZoom.disable();
+    map.getCanvas().style.cursor = 'crosshair';
+    drawingCoordsRef.current = [];
+
+    if (!map.getSource('draw-temp-source')) {
+      map.addSource('draw-temp-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({ id: 'draw-line-temp', type: 'line', source: 'draw-temp-source', paint: { 'line-color': '#00E5FF', 'line-width': 2, 'line-dasharray': [4, 4] } });
+      map.addLayer({ id: 'draw-points-temp', type: 'circle', source: 'draw-temp-source', paint: { 'circle-color': '#00E5FF', 'circle-radius': 4, 'circle-stroke-width': 1, 'circle-stroke-color': '#000' } });
+    }
+
+    const updateTempGeoJSON = () => {
+      const coords = drawingCoordsRef.current;
+      const src = map.getSource('draw-temp-source') as maplibregl.GeoJSONSource;
+      if (!src) return;
+      if (coords.length === 0) {
+        src.setData({ type: 'FeatureCollection', features: [] });
+        return;
+      }
+      const features: any[] = [{ type: 'Feature', geometry: { type: 'MultiPoint', coordinates: coords }, properties: {} }];
+      if (coords.length > 1) {
+        features.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: [...coords, coords[0]] }, properties: {} });
+      }
+      src.setData({ type: 'FeatureCollection', features });
+    };
+
+    let dblClickGuard = false;
+
+    const handleClick = (e: any) => {
+      // Skip clicks that are part of a double-click
+      if (dblClickGuard) return;
+      drawingCoordsRef.current.push([e.lngLat.lng, e.lngLat.lat]);
+      updateTempGeoJSON();
+    };
+
+    const handleDblClick = (e: any) => {
+      e.preventDefault();
+      dblClickGuard = true;
+      setTimeout(() => { dblClickGuard = false; }, 300);
+
+      // Remove the duplicate point that the click handler added for the first click of the double-click
+      if (drawingCoordsRef.current.length > 0) drawingCoordsRef.current.pop();
+
+      const coords = [...drawingCoordsRef.current];
+      if (coords.length >= 3) {
+        // Don't close the ring here — page.tsx's onDrawComplete already adds coords[0]
+        onDrawComplete?.(coords);
+      }
+      drawingCoordsRef.current = [];
+      updateTempGeoJSON();
+
+      // Clean up temp layers
+      if (map.getLayer('draw-line-temp')) map.removeLayer('draw-line-temp');
+      if (map.getLayer('draw-points-temp')) map.removeLayer('draw-points-temp');
+      if (map.getSource('draw-temp-source')) map.removeSource('draw-temp-source');
+    };
+
+    map.on('click', handleClick);
+    map.on('dblclick', handleDblClick);
+
+    return () => {
+      map.off('click', handleClick);
+      map.off('dblclick', handleDblClick);
+    };
+  }, [mapReady, drawingMode, onDrawComplete]);
+
+  // ── MAP CENTER REPORTING ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    const map = mapRef.current;
+
+    const reportCenter = () => {
+      const c = map.getCenter();
+      const b = map.getBounds();
+      onMapCenter?.({
+        lat: c.lat,
+        lng: c.lng,
+        bounds: b ? { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() } : undefined,
+      });
+    };
+
+    // Fire immediately so panels get initial coordinates
+    reportCenter();
+
+    map.on('moveend', reportCenter);
+    return () => { map.off('moveend', reportCenter); };
+  }, [mapReady, onMapCenter]);
 
   return <div ref={containerRef} className="absolute inset-0 w-full h-full" />;
 }

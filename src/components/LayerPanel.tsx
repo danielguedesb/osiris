@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Plane, Satellite, Sun, AlertTriangle, Camera,
   CloudLightning, Ship, Network, Database, Ghost,
-  Flame, Tv, Radio, Mountain, Anchor, Radar
+  Flame, Tv, Radio, Mountain, Anchor, Megaphone
 } from 'lucide-react';
 
 interface LayerPanelProps {
@@ -15,13 +15,33 @@ interface LayerPanelProps {
   isMobile?: boolean;
   theme?: 'core' | 'ghost';
   setTheme?: (theme: 'core' | 'ghost') => void;
+  /** Server-side capabilities, e.g. { cloudflare: true }. Layers declaring a
+   *  `requires` key stay hidden until the matching capability is present. */
+  capabilities?: Record<string, boolean>;
 }
 
-const LAYER_GROUPS = [
+interface LayerDef {
+  key: string;
+  label: string;
+  dataKey: string;
+  /** Reads a bucket out of data.category_counts instead of a top-level array. */
+  catKey?: string;
+  /** Capability that must be configured server-side for this layer to appear. */
+  requires?: string;
+}
+
+interface LayerGroupDef {
+  label: string;
+  fullLabel: string;
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
+  layers: LayerDef[];
+}
+
+const LAYER_GROUPS: LayerGroupDef[] = [
   {
     label: 'SDK',
     fullLabel: 'OSIRIS SDK',
-    icon: Database,
+    icon: Network,
     layers: [
       { key: 'sdk_sea', label: 'Maritime Lines', dataKey: 'sdk_entities' },
     ],
@@ -65,7 +85,6 @@ const LAYER_GROUPS = [
     layers: [
       { key: 'cctv', label: 'CCTV Cameras', dataKey: 'cameras' },
       { key: 'live_news', label: 'Live News Feeds', dataKey: 'live_feeds' },
-      { key: 'news_intel', label: 'SIGINT News', dataKey: 'sigint_news' },
     ],
   },
   {
@@ -85,7 +104,7 @@ const LAYER_GROUPS = [
     layers: [
       { key: 'infrastructure', label: 'Nuclear Facilities', dataKey: 'infrastructure' },
       { key: 'global_incidents', label: 'Global Incidents', dataKey: 'gdelt' },
-      { key: 'gps_jamming', label: 'GPS Jamming', dataKey: 'gps_jamming' },
+      { key: 'gdelt_events', label: 'GDELT Events', dataKey: 'gdelt_events' },
     ],
   },
   {
@@ -94,6 +113,16 @@ const LAYER_GROUPS = [
     icon: Network,
     layers: [
       { key: 'malware', label: 'Live Malware', dataKey: 'malware_threats' },
+      { key: 'cyber_attacks', label: 'Live Attacks', dataKey: 'cyber_attacks' },
+    ],
+  },
+  {
+    label: 'NETINTEL',
+    fullLabel: 'NET & EVENT INTEL',
+    icon: Megaphone,
+    layers: [
+      { key: 'cf_outages', label: 'Internet Outages', dataKey: 'cf_outages', requires: 'cloudflare' },
+      { key: 'cf_attacks', label: 'Attack Origins', dataKey: 'cf_attack_origins', requires: 'cloudflare' },
     ],
   },
   {
@@ -138,10 +167,17 @@ function ToggleSwitch({ active, onClick }: { active: boolean; onClick: () => voi
   );
 }
 
-function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'core', setTheme }: LayerPanelProps) {
+function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'core', setTheme, capabilities = {} }: LayerPanelProps) {
   const [hoveredGroup, setHoveredGroup] = useState<string | null>(null);
 
   const toggle = (key: string) => setActiveLayers((prev: any) => ({ ...prev, [key]: !prev[key] }));
+
+  /* Drop layers whose backing capability is not configured, then drop any group
+     left with nothing to show. */
+  const visibleGroups = LAYER_GROUPS.map(g => ({
+    ...g,
+    layers: g.layers.filter(l => !l.requires || capabilities[l.requires]),
+  })).filter(g => g.layers.length > 0);
 
   const getCount = (dk: string, catKey?: string): number | null => {
     if (!dk) return null;
@@ -163,9 +199,9 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
   if (isMobile) {
     return (
       <div className="flex flex-col gap-5 py-2">
-        {LAYER_GROUPS.map((group) => (
+        {visibleGroups.map((group) => (
           <div key={group.label} className="flex flex-col gap-2">
-            <div className="text-[9px] font-mono tracking-[0.2em] uppercase text-white/30 border-b border-white/[0.06] pb-1.5">
+            <div className="text-[11px] font-mono tracking-[0.2em] uppercase text-white/30 border-b border-white/[0.06] pb-1.5">
               {group.fullLabel}
             </div>
             <div className="flex flex-col gap-1">
@@ -178,11 +214,11 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
                       active={!!isLayerActive}
                       onClick={() => toggle(layer.key)}
                     />
-                    <span className={`text-[10px] font-mono uppercase tracking-wider flex-1 transition-colors ${isLayerActive ? 'text-white/80' : 'text-white/40'}`}>
+                    <span className={`text-[12px] font-mono uppercase tracking-wider flex-1 transition-colors ${isLayerActive ? 'text-white/80' : 'text-white/40'}`}>
                       {layer.label}
                     </span>
                     {count !== null && (
-                      <span className="text-[8px] font-mono tabular-nums text-white/20">
+                      <span className="text-[10px] font-mono tabular-nums text-white/20">
                         {count.toLocaleString()}
                       </span>
                     )}
@@ -196,7 +232,7 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
         {/* MOBILE GHOST TOGGLE */}
         {setTheme && (
           <div className="flex items-center justify-between mt-2 pt-3 border-t border-white/[0.06] px-1">
-            <span className="text-[9px] font-mono tracking-[0.2em] text-white/25 uppercase">Ghost Protocol</span>
+            <span className="text-[11px] font-mono tracking-[0.2em] text-white/25 uppercase">Ghost Protocol</span>
             <button
               onClick={() => setTheme(theme === 'core' ? 'ghost' : 'core')}
               className="w-8 h-8 rounded-full flex items-center justify-center transition-all"
@@ -227,7 +263,7 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
       }}
     >
       <div className="flex-1 flex flex-col items-center gap-1">
-        {LAYER_GROUPS.map((group) => {
+        {visibleGroups.map((group) => {
           const groupActive = group.layers.some(l => activeLayers[l.key]);
           const isHovered = hoveredGroup === group.label;
           const Icon = group.icon;
@@ -278,7 +314,7 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
                       boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
                     }}
                   >
-                    <div className="text-[9px] font-mono tracking-[0.2em] uppercase text-white/30 mb-2.5 pb-1.5 border-b border-white/[0.04]">
+                    <div className="text-[11px] font-mono tracking-[0.2em] uppercase text-white/30 mb-2.5 pb-1.5 border-b border-white/[0.04]">
                       {group.fullLabel}
                     </div>
                     <div className="flex flex-col gap-0.5">
@@ -293,11 +329,11 @@ function LayerPanel({ data, activeLayers, setActiveLayers, isMobile, theme = 'co
                             onClick={() => toggle(layer.key)}
                           >
                             <ToggleSwitch active={!!isLayerActive} onClick={() => {}} />
-                            <span className={`text-[10px] font-mono uppercase tracking-wider flex-1 transition-colors duration-200 ${isLayerActive ? 'text-white/70' : 'text-white/35'}`}>
+                            <span className={`text-[12px] font-mono uppercase tracking-wider flex-1 transition-colors duration-200 ${isLayerActive ? 'text-white/70' : 'text-white/35'}`}>
                               {layer.label}
                             </span>
                             {count !== null && (
-                              <span className="text-[9px] font-mono tabular-nums text-white/20">
+                              <span className="text-[11px] font-mono tabular-nums text-white/20">
                                 {count.toLocaleString()}
                               </span>
                             )}
